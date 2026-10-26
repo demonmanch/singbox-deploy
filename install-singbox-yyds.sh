@@ -1532,7 +1532,7 @@ action_generate_relay() {
 
     # 落地机入口地址：NAT/转发机上自动检测到的通常是【出口IP】，客户端/线路机连不上，
     # 因此不再静默使用检测结果，必须由用户确认或输入商家提供的【入口IP/连接地址】
-    local INBOUND_IP="" DETECTED_IP confirm input_ip
+    local INBOUND_IP="" DETECTED_IP confirm input_ip SSH_PORT DETECTED_SSH_PORT input_ssh
     DETECTED_IP="$(normalize_host "$(get_public_ip)")"
     echo ""
     info "=== 设置落地机(本机)入口地址 ==="
@@ -1566,6 +1566,26 @@ action_generate_relay() {
         INBOUND_IP="$input_ip"
     done
 
+    # 落地机 SSH 连接端口（线路机用它从本机拉取脚本）。NAT 机器上 sshd 内部是 22，
+    # 但外部要用商家映射的端口，所以必须询问；优先使用缓存，其次自动检测
+    DETECTED_SSH_PORT=$(sshd -T 2>/dev/null | awk '/^port /{print $2;exit}' || true)
+    if [ -z "$DETECTED_SSH_PORT" ]; then
+        DETECTED_SSH_PORT=$(grep -Ei '^[[:space:]]*Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2;exit}' || true)
+    fi
+    DETECTED_SSH_PORT="${DETECTED_SSH_PORT:-22}"
+    SSH_PORT="${LANDING_SSH_PORT:-$DETECTED_SSH_PORT}"
+    validate_port "$SSH_PORT" || SSH_PORT="$DETECTED_SSH_PORT"
+    while true; do
+        read -r -p "请输入落地机的 SSH 连接端口(就是你平时 SSH 登录本机用的端口，NAT 机器填商家映射的端口，回车默认 ${SSH_PORT}): " input_ssh
+        input_ssh=$(printf '%s' "${input_ssh:-$SSH_PORT}" | tr -d '[:space:]')
+        if validate_port "$input_ssh"; then
+            SSH_PORT="$input_ssh"
+            break
+        fi
+        err "SSH 端口无效: '${input_ssh}'（需为 1-65535 的数字）"
+    done
+    cache_set LANDING_SSH_PORT "$SSH_PORT"
+
     while true; do
         echo ""
         info "即将生成线路机脚本，出站参数如下(请核对):"
@@ -1574,6 +1594,7 @@ action_generate_relay() {
         echo "   加密方式              : $SS_METHOD"
         echo "   密码                  : $(mask_secret "$SS_PSK")  (取自 $CONFIG_PATH)"
         echo "   Reality SNI           : ${REALITY_SNI:-addons.mozilla.org}"
+        echo "   落地机 SSH 端口       : ${SSH_PORT}  (线路机用它拉取脚本，NAT 机器须为商家映射的 SSH 端口)"
         if [ "$INBOUND_IP" = "$DETECTED_IP" ]; then
             warn "落地机地址与检测到的出口IP 相同；若本机是 NAT/转发机，请改为入口IP"
         fi
@@ -1885,13 +1906,10 @@ RELAY_EOF
     cp "$RELAY_SCRIPT" /tmp/relay-install.sh 2>/dev/null && chmod 600 /tmp/relay-install.sh || true
 
     # 检测落地机 SSH 端口（NAT 机器上应为商家映射的 SSH 端口）
-    local SSH_PORT RELAY_B64 SSH_HOST show_full
-    SSH_PORT=$(sshd -T 2>/dev/null | awk '/^port /{print $2;exit}' || true)
-    if [ -z "$SSH_PORT" ]; then
-        SSH_PORT=$(grep -Ei '^[[:space:]]*Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2;exit}' || true)
-    fi
-    SSH_PORT="${SSH_PORT:-22}"
+    local RELAY_B64 SSH_HOST show_full SSH_FETCH_CMD
     SSH_HOST="$INBOUND_IP"
+    # 方法一命令：线路机没有 ssh 客户端时先自动安装（兼容 bash / ash）
+    SSH_FETCH_CMD="command -v ssh >/dev/null 2>&1 || { if command -v apk >/dev/null 2>&1; then apk add --no-cache openssh-client; elif command -v apt-get >/dev/null 2>&1; then apt-get update -y && apt-get install -y openssh-client; else yum install -y openssh-clients; fi; }; ssh -p ${SSH_PORT} root@${SSH_HOST} \"cat /root/relay-install.sh\" > /root/relay-install.sh && bash /root/relay-install.sh"
     RELAY_B64=$(base64 -w0 "$RELAY_SCRIPT" 2>/dev/null || base64 "$RELAY_SCRIPT" | tr -d '\n')
 
     echo ""
@@ -1901,11 +1919,12 @@ RELAY_EOF
     echo "1. 用 SSH 登录【线路机】(不是本机)，切换到 root。"
     echo "2. 任选下面一种方法，把整行命令复制到线路机执行："
     echo ""
-    echo "   【方法一(推荐)】线路机通过 SSH 从落地机拉取脚本并执行:"
+    echo "   【方法一(推荐)】线路机通过 SSH 从落地机拉取脚本并执行(整行复制):"
     echo ""
-    echo "ssh -p ${SSH_PORT} root@${SSH_HOST} \"cat /root/relay-install.sh\" > /root/relay-install.sh && bash /root/relay-install.sh"
+    echo "$SSH_FETCH_CMD"
     echo ""
-    echo "   - ${SSH_PORT} 是本机(落地机)的 SSH 端口；NAT 机器请确认是商家映射的 SSH 端口，不对就改成商家给的端口"
+    echo "   - 线路机没有 ssh 客户端时，这行命令会先自动安装(openssh-client)"
+    echo "   - ${SSH_PORT} 是你刚才填写的落地机 SSH 连接端口"
     echo "   - 首次连接会问 Are you sure you want to continue connecting，输入 yes 回车"
     echo "   - 然后输入【落地机】的 root 密码（输入时屏幕不显示任何字符，属正常），回车"
     echo ""

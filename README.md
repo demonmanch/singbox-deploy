@@ -20,8 +20,10 @@
 >   - `bash /root/relay-install.sh show` 查看链接
 >   - 已安装过时直接运行脚本会出现菜单：1. 重新安装 2. 修改节点名称 3. 查看链接
 > - **一条命令部署线路机**：落地机执行 `sb` → 选「生成线路机脚本」后，脚本保存在落地机 `/root/relay-install.sh`（权限 600），默认不再刷屏输出整个脚本，而是给出分步说明和两种整行复制的方法：
->   - 方法一（推荐，在线路机执行）：`ssh -p <落地机SSH端口> root@<落地机入口IP> "cat /root/relay-install.sh" > /root/relay-install.sh && bash /root/relay-install.sh`
->     （SSH 端口自动检测；NAT 机器请用商家映射的 SSH 端口；首次连接输入 yes，再输入落地机 root 密码，输入时不显示）
+>   - 生成时会询问「落地机的 SSH 连接端口」（就是平时 SSH 登录落地机用的端口；NAT 机器填商家映射的端口，例如 45466，而不是机器内部的 22），保存为 `LANDING_SSH_PORT`，下次回车即沿用
+>   - 方法一（推荐，在线路机整行执行；线路机没有 ssh 客户端会先自动安装 openssh-client，bash/ash 均可）：
+>     `command -v ssh >/dev/null 2>&1 || { if command -v apk >/dev/null 2>&1; then apk add --no-cache openssh-client; elif command -v apt-get >/dev/null 2>&1; then apt-get update -y && apt-get install -y openssh-client; else yum install -y openssh-clients; fi; }; ssh -p <落地机SSH端口> root@<落地机入口IP> "cat /root/relay-install.sh" > /root/relay-install.sh && bash /root/relay-install.sh`
+>     （首次连接输入 yes，再输入落地机 root 密码，输入时不显示）
 >   - 方法二：输出最后一行的 `echo '<base64>' | base64 -d > /root/relay-install.sh && bash /root/relay-install.sh`，整行复制到线路机执行即可
 >   - 运行时端口/名称直接回车用默认值；把得到的 vless:// 链接导入 Shadowrocket，无需设置「代理通过」；记得在线路机云厂商安全组（如 Oracle）放行监听端口
 >   - 如需查看完整脚本，生成时在「是否显示完整脚本内容?(y/N)」处输入 y
