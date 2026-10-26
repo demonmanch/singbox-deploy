@@ -1,5 +1,26 @@
 # Sing-box 多协议一键部署脚本
 
+> ## 🔧 本 Fork（demonmanch/singbox-deploy）的修复说明
+>
+> 一键安装（使用本 fork）：
+>
+> ```bash
+> bash -c "$(curl -fsSL https://raw.githubusercontent.com/demonmanch/singbox-deploy/main/install-singbox-yyds.sh)"
+> ```
+>
+> 修复 `install-singbox-yyds.sh` 中 `sb` 菜单「生成线路机脚本(出口为本机ss协议)」的问题（在 Alpine 3.21 LXC NAT 小鸡上实际踩坑）：
+>
+> - **SS 密码不一致**：生成线路机脚本时，SS 端口/加密方式/密码直接从 `/etc/sing-box/config.json` 中实际生效的 SS 入站（优先 tag `ss-in`）读取，不再使用可能过期的缓存；缓存写入改为「替换已有键」，不再重复追加 `SS_PSK=` 等旧值。
+> - **入口IP vs 出口IP**：NAT/转发机上自动检测到的公网 IP 通常是**出口IP**（例如落地机出口是 SoftBank 126.x，而连接用的是香港转发入口 45.x），用它生成线路机脚本会连不上。现在会明确提示并要求填写**商家提供的入口IP/连接地址（通常就是 SSH 登录用的 IP）**；检测到的 IP 只作参考，回车使用它需要再次 y 确认；已保存的 `CUSTOM_IP` 作为默认值。
+> - **地址校验**：落地机地址只接受 IPv4 / IPv6 / 域名，拒绝纯数字（如误填端口 `45467`）并重新输入；生成前显示汇总（地址、端口、加密方式、打码的密码）并 y/N 确认，可改填其他 IP。
+> - **NAT 端口**：NAT 机器上 SS 端口必须是商家映射给你的端口之一，提示和汇总里都会提醒。
+> - **线路机脚本**：覆盖线路机已有 `/etc/sing-box/config.json` 前自动备份为 `config.json.bak.时间戳` 并给出警告；配置改用 jq 生成，密码含特殊字符也不会出错；补充 SS 入站时加密方式与变量一致（默认仍为 aes-128-gcm），并校验配置、失败自动还原。
+> - **节点名称/备注**：线路机安装时可设置 vless 链接 `#` 后的节点名称（默认 `中转-线路机IP`，支持中文/空格，自动 URL 编码）。之后可随时修改，只重新生成链接和 `/etc/sing-box/relay_uri.txt`，不动运行中的配置：
+>   - `bash /root/relay-install.sh rename`（或 `bash /etc/sing-box/relay-install.sh rename`）
+>   - `bash /root/relay-install.sh show` 查看链接
+>   - 已安装过时直接运行脚本会出现菜单：1. 重新安装 2. 修改节点名称 3. 查看链接
+
+
 一个强大的 Sing-box 自动化部署工具，支持SS/HY2/TUIC/VLESS Reality/AnyTLS Reality 协议自选部署和线路机 VLESS Reality 中转的完整解决方案。
 
 ---

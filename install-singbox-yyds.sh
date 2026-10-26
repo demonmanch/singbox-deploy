@@ -1064,14 +1064,91 @@ if [ "${ENABLE_ANYTLS:-false}" = "true" ]; then
 fi
 }
 
-# 获取公网IP（原始方法）
+# 获取公网IP（原始方法；仅接受合法 IP，避免把错误页面当成 IP）
 get_public_ip() {
     local ip=""
     for url in "https://api.ipify.org" "https://ipinfo.io/ip" "https://ifconfig.me"; do
-        ip=$(curl -s --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]')
-        [ -n "$ip" ] && echo "$ip" && return 0
+        ip=$(curl -s --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]' || true)
+        if [ -n "$ip" ] && validate_host "$ip"; then
+            echo "$ip"
+            return 0
+        fi
     done
     echo "YOUR_SERVER_IP"
+}
+
+# 写入 KEY=VALUE 到指定文件：已存在的 KEY 会被替换而不是重复追加
+# fix: 原脚本用 echo >> 追加，导致缓存里出现多个 SS_PSK= 等旧值
+kv_set() {
+    local file="$1" key="$2" val="$3" tmp
+    mkdir -p "$(dirname "$file")"
+    touch "$file"
+    tmp=$(mktemp)
+    grep -v "^${key}=" "$file" > "$tmp" || true
+    printf '%s=%q\n' "$key" "$val" >> "$tmp"
+    cat "$tmp" > "$file"
+    rm -f "$tmp"
+}
+cache_set() { kv_set "$CACHE_FILE" "$1" "$2"; }
+
+# 规范化主机：去空白、去掉 IPv6 方括号
+normalize_host() {
+    local h
+    h=$(printf '%s' "$1" | tr -d '[:space:]')
+    h="${h#[}"
+    h="${h%]}"
+    printf '%s' "$h"
+}
+
+# 校验落地机地址：IPv4 / IPv6 / 含字母和点的域名；拒绝纯数字(端口)等
+validate_host() {
+    local h="$1" o
+    [ -z "$h" ] && return 1
+    # IPv4
+    if [[ "$h" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+        for o in "${BASH_REMATCH[@]:1}"; do
+            [ "$((10#$o))" -le 255 ] || return 1
+        done
+        return 0
+    fi
+    # IPv6（至少两个冒号，仅含十六进制/冒号/点）
+    if [[ "$h" =~ ^[0-9A-Fa-f:.]+$ ]] && [[ "$h" == *:*:* ]]; then
+        return 0
+    fi
+    # 域名：必须包含字母和点
+    if [[ "$h" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]] \
+        && [[ "$h" =~ [A-Za-z] ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# 从 config.json 直接读取 SS 入站（优先 tag=ss-in，其次第一个 shadowsocks）
+SS_INBOUND_SELECTOR='first((.inbounds // [])[] | select(.type=="shadowsocks" and .tag=="ss-in")) // first((.inbounds // [])[] | select(.type=="shadowsocks")) // empty'
+ss_from_config() {
+    # 用法: ss_from_config <字段>   字段: listen_port | method | password
+    [ -f "$CONFIG_PATH" ] || return 0
+    jq -r "($SS_INBOUND_SELECTOR) | .$1 // empty" "$CONFIG_PATH" 2>/dev/null | head -n1 || true
+}
+
+# 端口校验 1-65535
+validate_port() {
+    [[ "$1" =~ ^[0-9]{1,5}$ ]] && [ "$((10#$1))" -ge 1 ] && [ "$((10#$1))" -le 65535 ]
+}
+
+# 转义为可放进 shell 单引号 '...' 的内容，再转义 sed 替换串中的特殊字符 \ | &
+sed_sq_escape() {
+    printf '%s' "$1" | sed -e "s/'/'\\\\''/g" -e 's/[\\|&]/\\&/g'
+}
+
+# 遮蔽密码，仅显示前 4 位
+mask_secret() {
+    local s="$1"
+    if [ "${#s}" -le 4 ]; then
+        printf '%s' "****"
+    else
+        printf '%s****' "${s:0:4}"
+    fi
 }
 
 # 生成并保存URI
@@ -1343,60 +1420,80 @@ action_uninstall() {
 # 生成线路机脚本
 action_generate_relay() {
     read_config || return 1
-    
+
+    # 若本机 config.json 已有 SS 入站（缓存标记缺失/过期），直接使用，避免重复添加 ss-in
+    if [ "${ENABLE_SS:-false}" != "true" ] && [ -n "$(ss_from_config listen_port)" ]; then
+        info "检测到 config.json 中已有 SS 入站，直接使用"
+        ENABLE_SS=true
+        cache_set ENABLE_SS true
+        kv_set /etc/sing-box/.protocols ENABLE_SS true
+    fi
+
     # 检查是否启用了SS
     if [ "${ENABLE_SS:-false}" != "true" ]; then
         warn "未检测到 SS 协议,需要先部署 SS 作为入站"
-        read -p "是否现在部署 SS 协议?(y/N): " deploy_ss
+        read -r -p "是否现在部署 SS 协议?(y/N): " deploy_ss
         if [[ "$deploy_ss" =~ ^[Yy]$ ]]; then
             info "开始部署 SS 协议..."
-            
-            # 让用户选择端口
-            read -p "请输入 SS 端口(留空则随机 10000-60000): " USER_SS_PORT
-            SS_PORT="${USER_SS_PORT:-$(rand_port)}"
+
+            # 让用户选择端口（校验 1-65535）
+            while true; do
+                read -r -p "请输入 SS 端口(NAT 机器请填商家映射的端口，留空则随机 10000-60000): " USER_SS_PORT
+                SS_PORT="${USER_SS_PORT:-$(rand_port)}"
+                validate_port "$SS_PORT" && break
+                err "端口无效: $SS_PORT (需为 1-65535 的数字)"
+            done
             SS_PSK=$(rand_pass)
             SS_METHOD="aes-128-gcm"
-            
-            info "SS 端口: $SS_PORT | 密码已自动生成"
-            
+
+            info "SS 端口: $SS_PORT | 加密: $SS_METHOD | 密码已自动生成"
+
             info "正在停止服务..."
             service_stop || warn "停止服务失败"
-            
+
             cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
-            
-            # 添加 SS inbound
-            jq --argjson port "$SS_PORT" --arg psk "$SS_PSK" '
-            .inbounds += [{
+
+            # 添加 SS inbound（method 与 SS_METHOD 变量保持一致）
+            if ! jq --argjson port "$SS_PORT" --arg psk "$SS_PSK" --arg method "$SS_METHOD" '
+            .inbounds = ((.inbounds // []) + [{
               "type": "shadowsocks",
               "listen": "::",
               "listen_port": $port,
-              "method": "aes-128-gcm",
+              "method": $method,
               "password": $psk,
               "tag": "ss-in"
-            }]
-            ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
-            
-            # 更新缓存和协议标记
-            sed -i 's/ENABLE_SS=false/ENABLE_SS=true/' "$CACHE_FILE" 2>/dev/null || echo "ENABLE_SS=true" >> "$CACHE_FILE"
-            echo "SS_PORT=$SS_PORT" >> "$CACHE_FILE"
-            echo "SS_PSK=$SS_PSK" >> "$CACHE_FILE"
-            echo "SS_METHOD=$SS_METHOD" >> "$CACHE_FILE"
-            
-            # 同步更新协议标记文件
-            PROTOCOL_FILE="/etc/sing-box/.protocols"
-            if [ -f "$PROTOCOL_FILE" ]; then
-                sed -i 's/ENABLE_SS=false/ENABLE_SS=true/' "$PROTOCOL_FILE"
-            else
-                echo "ENABLE_SS=true" >> "$PROTOCOL_FILE"
+            }])
+            ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp"; then
+                rm -f "${CONFIG_PATH}.tmp"
+                err "写入 SS 入站失败，配置未修改"
+                service_start || true
+                return 1
             fi
-            
+            mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+
+            if command -v sing-box >/dev/null 2>&1 && ! sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1; then
+                err "新配置校验失败，已从 ${CONFIG_PATH}.bak 还原"
+                cp "${CONFIG_PATH}.bak" "$CONFIG_PATH"
+                service_start || true
+                return 1
+            fi
+
+            # 更新缓存和协议标记（替换已有键，不再重复追加）
+            cache_set ENABLE_SS true
+            cache_set SS_PORT "$SS_PORT"
+            cache_set SS_PSK "$SS_PSK"
+            cache_set SS_METHOD "$SS_METHOD"
+
+            # 同步更新协议标记文件
+            kv_set /etc/sing-box/.protocols ENABLE_SS true
+
             # 更新当前会话变量
             ENABLE_SS=true
-            
+
             info "SS 已部署 - 端口: $SS_PORT"
             service_start || warn "启动服务失败"
             sleep 1
-            
+
             # 重新读取配置
             read_config
         else
@@ -1404,27 +1501,218 @@ action_generate_relay() {
             return 1
         fi
     fi
-    
-    # 线路机模板使用 CUSTOM_IP（若设置）或当前公共 IP
-    if [ -n "${CUSTOM_IP:-}" ]; then
-        INBOUND_IP="${CUSTOM_IP}"
+
+    # 以 config.json 中实际生效的 SS 入站为准（缓存可能过期）；找不到时才回退到缓存
+    local cfg_port cfg_method cfg_psk
+    cfg_port=$(ss_from_config listen_port)
+    cfg_method=$(ss_from_config method)
+    cfg_psk=$(ss_from_config password)
+    if [ -n "$cfg_port" ] && [ -n "$cfg_method" ] && [ -n "$cfg_psk" ]; then
+        SS_PORT="$cfg_port"
+        SS_METHOD="$cfg_method"
+        SS_PSK="$cfg_psk"
+        # 顺便把缓存同步为真实值
+        cache_set SS_PORT "$SS_PORT"
+        cache_set SS_METHOD "$SS_METHOD"
+        cache_set SS_PSK "$SS_PSK"
     else
-        INBOUND_IP="$(get_public_ip)"
+        warn "未能从 $CONFIG_PATH 读取 SS 入站，回退使用缓存 $CACHE_FILE 中的值"
+    fi
+    SS_METHOD="${SS_METHOD:-aes-128-gcm}"
+
+    if [ -z "${SS_PSK:-}" ] || ! validate_port "${SS_PORT:-}"; then
+        err "SS 端口或密码无效(端口: ${SS_PORT:-空})，请检查 $CONFIG_PATH"
+        return 1
+    fi
+
+    # 本机看起来是线路机（已有 relay-out 出站）时提醒：选项 11 应在落地机上运行
+    if jq -e '[(.outbounds // [])[] | select(.tag=="relay-out")] | length > 0' "$CONFIG_PATH" >/dev/null 2>&1; then
+        warn "本机 config.json 含有 relay-out 出站，看起来是线路机！此功能应在【落地机】上运行。"
+    fi
+
+    # 落地机入口地址：NAT/转发机上自动检测到的通常是【出口IP】，客户端/线路机连不上，
+    # 因此不再静默使用检测结果，必须由用户确认或输入商家提供的【入口IP/连接地址】
+    local INBOUND_IP="" DETECTED_IP confirm input_ip
+    DETECTED_IP="$(normalize_host "$(get_public_ip)")"
+    echo ""
+    info "=== 设置落地机(本机)入口地址 ==="
+    echo "   入口IP: 线路机/客户端连接本机用的地址（通常就是你 SSH 登录用的 IP，或商家给的 NAT 入口IP/域名）"
+    echo "   出口IP: 本机访问外网时显示的 IP。NAT/转发机上出口IP 与入口IP 往往不同，填出口IP 将无法连接！"
+    echo "   参考 - 自动检测到的出口IP: ${DETECTED_IP} （NAT 机器上通常不可用）"
+    echo "   注意 - NAT 机器上 SS 端口(${SS_PORT})必须是商家映射给你的端口之一，否则线路机无法连到落地机"
+    if [ -n "${CUSTOM_IP:-}" ]; then
+        echo "   已保存的连接地址(CUSTOM_IP): ${CUSTOM_IP}"
+    fi
+    echo ""
+
+    while [ -z "$INBOUND_IP" ]; do
+        if [ -n "${CUSTOM_IP:-}" ]; then
+            read -r -p "请输入落地机入口IP/域名(回车使用已保存的 ${CUSTOM_IP}): " input_ip
+            input_ip="$(normalize_host "${input_ip:-$CUSTOM_IP}")"
+        else
+            read -r -p "请输入落地机入口IP/域名(商家提供的连接地址，回车=使用检测到的 ${DETECTED_IP}): " input_ip
+            input_ip="$(normalize_host "$input_ip")"
+            if [ -z "$input_ip" ]; then
+                warn "检测到的 ${DETECTED_IP} 是出口IP，NAT/转发机上通常无法作为入口连接！"
+                read -r -p "确定使用 ${DETECTED_IP} 作为落地机地址?(y/N): " confirm
+                [[ "$confirm" =~ ^[Yy]$ ]] || continue
+                input_ip="$DETECTED_IP"
+            fi
+        fi
+        if ! validate_host "$input_ip"; then
+            err "落地机地址无效: '${input_ip}'（需为 IPv4、IPv6 或含字母和点的域名，不能是端口号）"
+            continue
+        fi
+        INBOUND_IP="$input_ip"
+    done
+
+    while true; do
+        echo ""
+        info "即将生成线路机脚本，出站参数如下(请核对):"
+        echo "   落地机入口地址(server): $INBOUND_IP"
+        echo "   落地机 SS 端口        : $SS_PORT  (NAT 机器须为商家映射端口)"
+        echo "   加密方式              : $SS_METHOD"
+        echo "   密码                  : $(mask_secret "$SS_PSK")  (取自 $CONFIG_PATH)"
+        echo "   Reality SNI           : ${REALITY_SNI:-addons.mozilla.org}"
+        if [ "$INBOUND_IP" = "$DETECTED_IP" ]; then
+            warn "落地机地址与检测到的出口IP 相同；若本机是 NAT/转发机，请改为入口IP"
+        fi
+        echo ""
+        read -r -p "确认生成?(y=确认 / i=输入其他落地IP / N=取消): " confirm
+        case "$confirm" in
+            [Yy]) break ;;
+            [Ii])
+                read -r -p "请输入落地机入口IP或域名: " input_ip
+                input_ip="$(normalize_host "$input_ip")"
+                if validate_host "$input_ip"; then
+                    INBOUND_IP="$input_ip"
+                else
+                    err "落地机地址无效: '${input_ip}'（需为 IPv4、IPv6 或含字母和点的域名，不能是端口号），保持原值"
+                fi
+                ;;
+            *)
+                info "已取消"
+                return 1
+                ;;
+        esac
+    done
+
+    # 记住确认过的入口地址，下次作为默认值
+    if [ "${CUSTOM_IP:-}" != "$INBOUND_IP" ]; then
+        cache_set CUSTOM_IP "$INBOUND_IP"
+        info "已将入口地址 $INBOUND_IP 保存为 CUSTOM_IP（下次默认使用，节点链接也会用它）"
     fi
 
     PUBLIC_IP="$INBOUND_IP"
     RELAY_SCRIPT="/tmp/relay-install.sh"
-    
+
     info "正在生成线路机脚本: $RELAY_SCRIPT"
-    
+
     cat > "$RELAY_SCRIPT" <<'RELAY_EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
 info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
+warn() { echo -e "\033[1;33m[WARN]\033[0m $*"; }
 err()  { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
 
 [ "$(id -u)" != "0" ] && err "必须以 root 运行" && exit 1
+
+# ===== 落地机参数（由落地机 sb 生成时填入）=====
+LANDING_SERVER='__INBOUND_IP__'
+LANDING_PORT='__INBOUND_PORT__'
+LANDING_METHOD='__INBOUND_METHOD__'
+LANDING_PASSWORD='__INBOUND_PASSWORD__'
+RELAY_SNI='__REALITY_SNI__'
+
+RELAY_ENV="/etc/sing-box/relay.env"
+RELAY_URI_FILE="/etc/sing-box/relay_uri.txt"
+SELF_COPY="/etc/sing-box/relay-install.sh"
+
+# 节点名称 URL 编码（支持中文/空格）
+uri_encode() { jq -rn --arg v "$1" '$v|@uri'; }
+
+# 根据 relay.env 生成链接并写入 relay_uri.txt（不改动运行中的配置）
+build_link() {
+    local name_enc
+    name_enc=$(uri_encode "$NODE_NAME")
+    RELAY_URI="vless://$UUID@$PUB_IP_URI:$LISTEN_PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$RELAY_SNI&fp=chrome&pbk=$REALITY_PUB&sid=$REALITY_SID#$name_enc"
+    mkdir -p /etc/sing-box
+    echo "$RELAY_URI" > "$RELAY_URI_FILE"
+}
+
+save_env() {
+    mkdir -p /etc/sing-box
+    {
+        printf 'UUID=%q\n' "$UUID"
+        printf 'PUB_IP=%q\n' "$PUB_IP"
+        printf 'LISTEN_PORT=%q\n' "$LISTEN_PORT"
+        printf 'REALITY_PUB=%q\n' "$REALITY_PUB"
+        printf 'REALITY_SID=%q\n' "$REALITY_SID"
+        printf 'RELAY_SNI=%q\n' "$RELAY_SNI"
+        printf 'NODE_NAME=%q\n' "$NODE_NAME"
+    } > "$RELAY_ENV"
+    chmod 600 "$RELAY_ENV"
+}
+
+set_pub_ip_uri() {
+    # IPv6 在链接里需要加方括号
+    if [[ "$PUB_IP" == *:* ]]; then PUB_IP_URI="[$PUB_IP]"; else PUB_IP_URI="$PUB_IP"; fi
+}
+
+show_link() {
+    if [ -f "$RELAY_URI_FILE" ]; then
+        echo "=============== 中转节点 Reality 链接 ==============="
+        cat "$RELAY_URI_FILE"
+        echo "===================================================="
+    else
+        err "未找到 $RELAY_URI_FILE"
+        return 1
+    fi
+}
+
+# 修改节点名称：只重新生成链接和 relay_uri.txt，不动 config.json / 服务
+rename_node() {
+    if [ ! -f "$RELAY_ENV" ]; then
+        err "未找到 $RELAY_ENV，请先完成线路机安装"
+        return 1
+    fi
+    command -v jq >/dev/null 2>&1 || { err "需要 jq"; return 1; }
+    # shellcheck disable=SC1090
+    . "$RELAY_ENV"
+    set_pub_ip_uri
+    local new_name
+    read -r -p "请输入新的节点名称/备注(回车保持「$NODE_NAME」): " new_name
+    NODE_NAME="${new_name:-$NODE_NAME}"
+    save_env
+    build_link
+    info "✅ 节点名称已更新为: $NODE_NAME（未改动运行中的配置）"
+    show_link
+}
+
+# ===== 入口：参数 / 已安装时的菜单 =====
+MODE="${1:-}"
+case "$MODE" in
+    rename) rename_node; exit $? ;;
+    show|link) show_link; exit $? ;;
+    install|"") ;;
+    *) err "未知参数: $MODE（可用: install | rename | show）"; exit 1 ;;
+esac
+
+if [ -z "$MODE" ] && [ -f "$RELAY_ENV" ]; then
+    echo "检测到本机已安装线路机配置:"
+    echo "1) 重新安装（会覆盖 /etc/sing-box/config.json，旧文件自动备份）"
+    echo "2) 修改节点名称"
+    echo "3) 查看链接"
+    echo "0) 退出"
+    read -r -p "请选择: " choice
+    case "$choice" in
+        1) ;;
+        2) rename_node; exit $? ;;
+        3) show_link; exit $? ;;
+        *) exit 0 ;;
+    esac
+fi
 
 detect_os(){
     . /etc/os-release 2>/dev/null || true
@@ -1457,29 +1745,63 @@ REALITY_KEYS=$(sing-box generate reality-keypair 2>/dev/null || echo "")
 REALITY_PK=$(echo "$REALITY_KEYS" | grep "PrivateKey" | awk '{print $NF}' | tr -d '\r' || echo "")
 REALITY_PUB=$(echo "$REALITY_KEYS" | grep "PublicKey" | awk '{print $NF}' | tr -d '\r' || echo "")
 REALITY_SID=$(sing-box generate rand 8 --hex 2>/dev/null || echo "0123456789abcdef")
+if [ -z "$REALITY_PK" ] || [ -z "$REALITY_PUB" ]; then
+    err "生成 Reality 密钥失败，请检查 sing-box 是否安装成功"
+    exit 1
+fi
 
-read -p "请输入线路机监听端口(留空随机 20000-65000): " USER_PORT
-LISTEN_PORT="${USER_PORT:-$(shuf -i 20000-65000 -n 1 2>/dev/null || echo 20443)}"
+while true; do
+    read -r -p "请输入线路机监听端口(留空随机 20000-65000): " USER_PORT
+    LISTEN_PORT="${USER_PORT:-$(shuf -i 20000-65000 -n 1 2>/dev/null || echo 20443)}"
+    if [[ "$LISTEN_PORT" =~ ^[0-9]{1,5}$ ]] && [ "$LISTEN_PORT" -ge 1 ] && [ "$LISTEN_PORT" -le 65535 ]; then
+        break
+    fi
+    err "端口无效: $LISTEN_PORT"
+done
+
+PUB_IP=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null | tr -d '[:space:]' || true)
+[ -z "$PUB_IP" ] && PUB_IP="YOUR_RELAY_IP"
+set_pub_ip_uri
+
+DEFAULT_NAME="中转-$PUB_IP"
+read -r -p "请输入节点名称/备注(显示在链接 # 后，回车默认「$DEFAULT_NAME」): " NODE_NAME
+NODE_NAME="${NODE_NAME:-$DEFAULT_NAME}"
 
 mkdir -p /etc/sing-box
 
-cat > /etc/sing-box/config.json <<EOF
+if [ -f /etc/sing-box/config.json ]; then
+    BAK="/etc/sing-box/config.json.bak.$(date +%Y%m%d%H%M%S)"
+    warn "将覆盖已有的 /etc/sing-box/config.json，旧配置已备份到: $BAK"
+    cp /etc/sing-box/config.json "$BAK"
+fi
+
+# 用 jq 生成配置，避免密码中的特殊字符破坏 JSON
+jq -n \
+  --argjson listen_port "$LISTEN_PORT" \
+  --arg uuid "$UUID" \
+  --arg sni "$RELAY_SNI" \
+  --arg pk "$REALITY_PK" \
+  --arg sid "$REALITY_SID" \
+  --arg server "$LANDING_SERVER" \
+  --argjson server_port "$LANDING_PORT" \
+  --arg method "$LANDING_METHOD" \
+  --arg password "$LANDING_PASSWORD" '
 {
   "log": { "level": "info", "timestamp": true },
   "inbounds": [
     {
       "type": "vless",
       "listen": "::",
-      "listen_port": $LISTEN_PORT,
-      "users": [{ "uuid": "$UUID", "flow": "xtls-rprx-vision" }],
+      "listen_port": $listen_port,
+      "users": [{ "uuid": $uuid, "flow": "xtls-rprx-vision" }],
       "tls": {
         "enabled": true,
-        "server_name": "__REALITY_SNI__",
+        "server_name": $sni,
         "reality": {
           "enabled": true,
-          "handshake": { "server": "__REALITY_SNI__", "server_port": 443 },
-          "private_key": "$REALITY_PK",
-          "short_id": ["$REALITY_SID"]
+          "handshake": { "server": $sni, "server_port": 443 },
+          "private_key": $pk,
+          "short_id": [$sid]
         }
       },
       "tag": "vless-in"
@@ -1488,17 +1810,16 @@ cat > /etc/sing-box/config.json <<EOF
   "outbounds": [
     {
       "type": "shadowsocks",
-      "server": "__INBOUND_IP__",
-      "server_port": __INBOUND_PORT__,
-      "method": "__INBOUND_METHOD__",
-      "password": "__INBOUND_PASSWORD__",
+      "server": $server,
+      "server_port": $server_port,
+      "method": $method,
+      "password": $password,
       "tag": "relay-out"
     },
     { "type": "direct", "tag": "direct-out" }
   ],
   "route": { "rules": [{ "inbound": "vless-in", "outbound": "relay-out" }] }
-}
-EOF
+}' > /etc/sing-box/config.json
 
 if [ "$OS" = "alpine" ]; then
     cat > /etc/init.d/sing-box <<'SVC'
@@ -1533,33 +1854,34 @@ SYSTEMD
     systemctl restart sing-box
 fi
 
-PUB_IP=$(curl -s https://api.ipify.org 2>/dev/null || echo "YOUR_RELAY_IP")
+# 保存参数并生成链接
+save_env
+build_link
 
-# 生成并保存链接
-RELAY_URI="vless://$UUID@$PUB_IP:$LISTEN_PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=__REALITY_SNI__&fp=chrome&pbk=$REALITY_PUB&sid=$REALITY_SID#relay"
-
-mkdir -p /etc/sing-box
-echo "$RELAY_URI" > /etc/sing-box/relay_uri.txt
+# 保存一份脚本副本，方便以后改名: bash /etc/sing-box/relay-install.sh rename
+if [ -f "$0" ] && [ "$(readlink -f "$0")" != "$SELF_COPY" ]; then
+    cp "$0" "$SELF_COPY" 2>/dev/null && chmod +x "$SELF_COPY" || true
+fi
 
 echo ""
 info "✅ 安装完成"
-echo "=============== 中转节点 Reality 链接 ==============="
-echo "$RELAY_URI"
-echo "===================================================="
+show_link
 echo ""
-info "💡 链接已保存到: /etc/sing-box/relay_uri.txt"
-info "💡 查看链接命令: cat /etc/sing-box/relay_uri.txt"
+info "💡 链接已保存到: $RELAY_URI_FILE"
+info "💡 查看链接命令: cat $RELAY_URI_FILE"
+info "💡 修改节点名称: bash $SELF_COPY rename"
 RELAY_EOF
 
     # 替换占位符（INBOUND_IP/PORT/METHOD/PASSWORD 同时替换 REALITY_SNI）
-    sed -i "s|__INBOUND_IP__|$INBOUND_IP|g" "$RELAY_SCRIPT"
-    sed -i "s|__INBOUND_PORT__|$SS_PORT|g" "$RELAY_SCRIPT"
-    sed -i "s|__INBOUND_METHOD__|$SS_METHOD|g" "$RELAY_SCRIPT"
-    sed -i "s|__INBOUND_PASSWORD__|$SS_PSK|g" "$RELAY_SCRIPT"
-    sed -i "s|__REALITY_SNI__|${REALITY_SNI:-addons.mozilla.org}|g" "$RELAY_SCRIPT"
-    
+    # 值放在单引号里，并转义 sed 特殊字符，避免密码含 / & | ' 等字符时出错
+    sed -i "s|__INBOUND_IP__|$(sed_sq_escape "$INBOUND_IP")|g" "$RELAY_SCRIPT"
+    sed -i "s|__INBOUND_PORT__|$(sed_sq_escape "$SS_PORT")|g" "$RELAY_SCRIPT"
+    sed -i "s|__INBOUND_METHOD__|$(sed_sq_escape "$SS_METHOD")|g" "$RELAY_SCRIPT"
+    sed -i "s|__INBOUND_PASSWORD__|$(sed_sq_escape "$SS_PSK")|g" "$RELAY_SCRIPT"
+    sed -i "s|__REALITY_SNI__|$(sed_sq_escape "${REALITY_SNI:-addons.mozilla.org}")|g" "$RELAY_SCRIPT"
+
     chmod +x "$RELAY_SCRIPT"
-    
+
     info "✅ 线路机脚本已生成: $RELAY_SCRIPT"
     echo ""
     info "请复制以下内容到线路机执行:"
@@ -1568,9 +1890,11 @@ RELAY_EOF
     echo "----------------------------------------"
     echo ""
     info "在线路机执行命令示例："
-    echo "   nano /tmp/relay-install.sh 保存后执行"
-    echo "   chmod +x /tmp/relay-install.sh && bash /tmp/relay-install.sh"
+    echo "   nano /root/relay-install.sh 粘贴保存后执行"
+    echo "   bash /root/relay-install.sh"
     echo ""
+    warn "注意: 线路机脚本会覆盖线路机上已有的 /etc/sing-box/config.json（会自动备份为 config.json.bak.时间戳）"
+    info "之后修改节点名称: bash /root/relay-install.sh rename   (或 bash /etc/sing-box/relay-install.sh rename)"
     info "复制执行完成后，即可在线路机完成 sing-box 中转节点部署。"
 }
 
