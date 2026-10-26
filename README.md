@@ -18,8 +18,9 @@
 > - **节点名称/备注**：线路机安装时可设置 vless 链接 `#` 后的节点名称（默认 `中转-线路机IP`，支持中文/空格，自动 URL 编码）。之后可随时修改，只重新生成链接和 `/etc/sing-box/relay_uri.txt`，不动运行中的配置：
 >   - `bash /root/relay-install.sh rename`（或 `bash /etc/sing-box/relay-install.sh rename`）
 >   - `bash /root/relay-install.sh show` 查看链接
->   - 已安装过时直接运行脚本会出现菜单：1. 重新安装 2. 修改节点名称 3. 查看链接
-> - **一条命令部署线路机**：落地机执行 `sb` → 选「生成线路机脚本」后，脚本保存在落地机 `/root/relay-install.sh`（权限 600），默认不再刷屏输出整个脚本，而是给出分步说明和两种整行复制的方法：
+>   - 已安装过时直接运行脚本会出现菜单：1. 重新安装 2. 修改节点名称 3. 查看链接 4. 添加/删除直连节点
+> - **可选：线路机直连节点**：线路机安装时会问「是否同时添加一个本机(线路机)直连出口的 VLESS Reality 节点? (y/N)」，默认 N（与以前完全一样）。选 y 后再输入直连端口（回车随机，不能与中转端口相同，已占用的端口会提示换一个）和名称（默认 `直连-<线路机IP>`），会多出一个 `vless-direct-in` 入站（独立 UUID，复用同一套 Reality 密钥/SNI/short_id）走线路机本机出口；中转入站仍走落地机。两条链接都写入 `/etc/sing-box/relay_uri.txt`，并分别标注「中转节点(出口落地机)」「直连节点(出口本机)」。之后可用 `bash /root/relay-install.sh direct`（或菜单 4）添加/删除直连节点，`rename` 可选择改哪个节点的名称。**记得在云安全组放行两个端口。**
+> - **一条命令部署线路机**：落地机执行 `sb` → 选「生成线路机脚本(出口为本机ss协议)」（菜单编号随已启用的协议数量变化，例如只装了一个协议时是 10），脚本保存在落地机 `/root/relay-install.sh`（权限 600），默认不再刷屏输出整个脚本，而是给出分步说明和两种整行复制的方法：
 >   - 生成时会询问「落地机的 SSH 连接端口」（就是平时 SSH 登录落地机用的端口；NAT 机器填商家映射的端口，例如 45466，而不是机器内部的 22），保存为 `LANDING_SSH_PORT`，下次回车即沿用
 >   - 方法一（推荐，在线路机整行执行；线路机没有 ssh 客户端会先自动安装 openssh-client，bash/ash 均可）：
 >     `command -v ssh >/dev/null 2>&1 || { if command -v apk >/dev/null 2>&1; then apk add --no-cache openssh-client; elif command -v apt-get >/dev/null 2>&1; then apt-get update -y && apt-get install -y openssh-client; else yum install -y openssh-clients; fi; }; ssh -p <落地机SSH端口> root@<落地机入口IP> "cat /root/relay-install.sh" > /root/relay-install.sh && bash /root/relay-install.sh`

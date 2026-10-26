@@ -1525,7 +1525,7 @@ action_generate_relay() {
         return 1
     fi
 
-    # 本机看起来是线路机（已有 relay-out 出站）时提醒：选项 11 应在落地机上运行
+    # 本机看起来是线路机（已有 relay-out 出站）时提醒：「生成线路机脚本」应在落地机上运行
     if jq -e '[(.outbounds // [])[] | select(.tag=="relay-out")] | length > 0' "$CONFIG_PATH" >/dev/null 2>&1; then
         warn "本机 config.json 含有 relay-out 出站，看起来是线路机！此功能应在【落地机】上运行。"
     fi
@@ -1646,20 +1646,76 @@ LANDING_METHOD='__INBOUND_METHOD__'
 LANDING_PASSWORD='__INBOUND_PASSWORD__'
 RELAY_SNI='__REALITY_SNI__'
 
+CONFIG="/etc/sing-box/config.json"
 RELAY_ENV="/etc/sing-box/relay.env"
 RELAY_URI_FILE="/etc/sing-box/relay_uri.txt"
 SELF_COPY="/etc/sing-box/relay-install.sh"
 
+# 直连节点默认关闭（旧版 relay.env 里没有这些字段）
+DIRECT_ENABLED=false
+DIRECT_PORT=""
+DIRECT_UUID=""
+DIRECT_NAME=""
+
 # 节点名称 URL 编码（支持中文/空格）
 uri_encode() { jq -rn --arg v "$1" '$v|@uri'; }
 
+valid_port() { [[ "$1" =~ ^[0-9]{1,5}$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
+
+# 端口是否已被占用（检测不到工具时视为未占用）
+port_in_use() {
+    if command -v ss >/dev/null 2>&1; then
+        ss -lntuH 2>/dev/null | awk '{print $5}' | grep -qE "[:.]$1\$"
+    elif command -v netstat >/dev/null 2>&1; then
+        netstat -lntu 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1\$"
+    else
+        return 1
+    fi
+}
+
+# 端口是否属于本机现有 sing-box 配置（重新安装/改配置时允许沿用自己的端口）
+own_port() {
+    [ -f "$CONFIG" ] && command -v jq >/dev/null 2>&1 \
+        && jq -e --argjson p "$1" 'any((.inbounds // [])[]; .listen_port == $p)' "$CONFIG" >/dev/null 2>&1
+}
+
+# 询问端口：$1=提示 $2=需避开的端口(可空)；结果放在 ASKED_PORT
+ask_port() {
+    local prompt="$1" avoid="${2:-}" p
+    while true; do
+        read -r -p "$prompt" p
+        if [ -z "$p" ]; then
+            p=$(shuf -i 20000-65000 -n 1 2>/dev/null || echo $(( (RANDOM % 45000) + 20000 )))
+            if [ "$p" = "$avoid" ] || port_in_use "$p"; then continue; fi
+        fi
+        if ! valid_port "$p"; then err "端口无效: $p（需为 1-65535 的数字）"; continue; fi
+        if [ -n "$avoid" ] && [ "$p" = "$avoid" ]; then err "不能与中转节点端口 $avoid 相同"; continue; fi
+        if port_in_use "$p" && ! own_port "$p"; then err "端口 $p 已被占用，请换一个"; continue; fi
+        ASKED_PORT="$p"
+        return 0
+    done
+}
+
+set_pub_ip_uri() {
+    # IPv6 在链接里需要加方括号
+    if [[ "$PUB_IP" == *:* ]]; then PUB_IP_URI="[$PUB_IP]"; else PUB_IP_URI="$PUB_IP"; fi
+}
+
+make_link() {
+    # $1=uuid $2=port $3=name
+    echo "vless://$1@$PUB_IP_URI:$2?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$RELAY_SNI&fp=chrome&pbk=$REALITY_PUB&sid=$REALITY_SID#$(uri_encode "$3")"
+}
+
 # 根据 relay.env 生成链接并写入 relay_uri.txt（不改动运行中的配置）
 build_link() {
-    local name_enc
-    name_enc=$(uri_encode "$NODE_NAME")
-    RELAY_URI="vless://$UUID@$PUB_IP_URI:$LISTEN_PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$RELAY_SNI&fp=chrome&pbk=$REALITY_PUB&sid=$REALITY_SID#$name_enc"
+    set_pub_ip_uri
+    RELAY_URI=$(make_link "$UUID" "$LISTEN_PORT" "$NODE_NAME")
     mkdir -p /etc/sing-box
     echo "$RELAY_URI" > "$RELAY_URI_FILE"
+    if [ "$DIRECT_ENABLED" = "true" ]; then
+        DIRECT_URI=$(make_link "$DIRECT_UUID" "$DIRECT_PORT" "$DIRECT_NAME")
+        echo "$DIRECT_URI" >> "$RELAY_URI_FILE"
+    fi
 }
 
 save_env() {
@@ -1672,17 +1728,37 @@ save_env() {
         printf 'REALITY_SID=%q\n' "$REALITY_SID"
         printf 'RELAY_SNI=%q\n' "$RELAY_SNI"
         printf 'NODE_NAME=%q\n' "$NODE_NAME"
+        printf 'DIRECT_ENABLED=%q\n' "$DIRECT_ENABLED"
+        printf 'DIRECT_PORT=%q\n' "$DIRECT_PORT"
+        printf 'DIRECT_UUID=%q\n' "$DIRECT_UUID"
+        printf 'DIRECT_NAME=%q\n' "$DIRECT_NAME"
     } > "$RELAY_ENV"
     chmod 600 "$RELAY_ENV"
 }
 
-set_pub_ip_uri() {
-    # IPv6 在链接里需要加方括号
-    if [[ "$PUB_IP" == *:* ]]; then PUB_IP_URI="[$PUB_IP]"; else PUB_IP_URI="$PUB_IP"; fi
+load_env() {
+    if [ ! -f "$RELAY_ENV" ]; then
+        err "未找到 $RELAY_ENV，请先完成线路机安装"
+        return 1
+    fi
+    command -v jq >/dev/null 2>&1 || { err "需要 jq"; return 1; }
+    # shellcheck disable=SC1090
+    . "$RELAY_ENV"
+    set_pub_ip_uri
 }
 
 show_link() {
-    if [ -f "$RELAY_URI_FILE" ]; then
+    if [ -f "$RELAY_ENV" ] && command -v jq >/dev/null 2>&1; then
+        load_env
+        build_link
+        echo "=============== 中转节点(出口落地机) ==============="
+        echo "$RELAY_URI"
+        if [ "$DIRECT_ENABLED" = "true" ]; then
+            echo "=============== 直连节点(出口本机) ================="
+            echo "$DIRECT_URI"
+        fi
+        echo "===================================================="
+    elif [ -f "$RELAY_URI_FILE" ]; then
         echo "=============== 中转节点 Reality 链接 ==============="
         cat "$RELAY_URI_FILE"
         echo "===================================================="
@@ -1694,21 +1770,110 @@ show_link() {
 
 # 修改节点名称：只重新生成链接和 relay_uri.txt，不动 config.json / 服务
 rename_node() {
-    if [ ! -f "$RELAY_ENV" ]; then
-        err "未找到 $RELAY_ENV，请先完成线路机安装"
-        return 1
+    load_env || return 1
+    local which="1" new_name
+    if [ "$DIRECT_ENABLED" = "true" ]; then
+        echo "要修改哪个节点的名称?"
+        echo "1) 中转节点(出口落地机): $NODE_NAME"
+        echo "2) 直连节点(出口本机)  : $DIRECT_NAME"
+        read -r -p "请选择(回车默认 1): " which
+        which="${which:-1}"
     fi
-    command -v jq >/dev/null 2>&1 || { err "需要 jq"; return 1; }
-    # shellcheck disable=SC1090
-    . "$RELAY_ENV"
-    set_pub_ip_uri
-    local new_name
-    read -r -p "请输入新的节点名称/备注(回车保持「$NODE_NAME」): " new_name
-    NODE_NAME="${new_name:-$NODE_NAME}"
+    if [ "$which" = "2" ] && [ "$DIRECT_ENABLED" = "true" ]; then
+        read -r -p "请输入新的直连节点名称(回车保持「$DIRECT_NAME」): " new_name
+        DIRECT_NAME="${new_name:-$DIRECT_NAME}"
+        info "✅ 直连节点名称: $DIRECT_NAME（未改动运行中的配置）"
+    else
+        read -r -p "请输入新的中转节点名称(回车保持「$NODE_NAME」): " new_name
+        NODE_NAME="${new_name:-$NODE_NAME}"
+        info "✅ 中转节点名称: $NODE_NAME（未改动运行中的配置）"
+    fi
     save_env
     build_link
-    info "✅ 节点名称已更新为: $NODE_NAME（未改动运行中的配置）"
     show_link
+}
+
+svc_restart() {
+    if command -v rc-service >/dev/null 2>&1; then
+        rc-service sing-box restart
+    else
+        systemctl restart sing-box
+    fi
+}
+
+check_config() {
+    if command -v sing-box >/dev/null 2>&1 && ! sing-box check -c "$CONFIG"; then
+        return 1
+    fi
+    return 0
+}
+
+# 向 config.json 加入直连 inbound（复用中转节点的 Reality 密钥/SNI/short_id）和路由规则
+apply_direct_config() {
+    local tmp="${CONFIG}.tmp"
+    jq --argjson port "$DIRECT_PORT" --arg uuid "$DIRECT_UUID" '
+      ((.inbounds // []) | map(select(.tag=="vless-in")) | .[0].tls) as $tls
+      | .inbounds = ([(.inbounds // [])[] | select(.tag != "vless-direct-in")] + [{
+          "type": "vless",
+          "listen": "::",
+          "listen_port": $port,
+          "users": [{ "uuid": $uuid, "flow": "xtls-rprx-vision" }],
+          "tls": $tls,
+          "tag": "vless-direct-in"
+        }])
+      | .outbounds = ((.outbounds // []) | if any(.[]; .tag=="direct-out") then . else . + [{"type":"direct","tag":"direct-out"}] end)
+      | .route.rules = ([(.route.rules // [])[] | select(.inbound != "vless-direct-in")] + [{ "inbound": "vless-direct-in", "outbound": "direct-out" }])
+    ' "$CONFIG" > "$tmp" && mv "$tmp" "$CONFIG"
+}
+
+remove_direct_config() {
+    local tmp="${CONFIG}.tmp"
+    jq '
+      .inbounds = [(.inbounds // [])[] | select(.tag != "vless-direct-in")]
+      | .route.rules = [(.route.rules // [])[] | select(.inbound != "vless-direct-in")]
+    ' "$CONFIG" > "$tmp" && mv "$tmp" "$CONFIG"
+}
+
+# 询问直连节点端口/名称（结果写入 DIRECT_* 变量）
+ask_direct() {
+    ask_port "请输入直连节点监听端口(回车随机 20000-65000，不能与中转端口 $LISTEN_PORT 相同): " "$LISTEN_PORT"
+    DIRECT_PORT="$ASKED_PORT"
+    DIRECT_UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || sing-box generate uuid)
+    local def="直连-$PUB_IP" n
+    read -r -p "请输入直连节点名称/备注(回车默认「$def」): " n
+    DIRECT_NAME="${n:-$def}"
+    DIRECT_ENABLED=true
+}
+
+# 已安装后：添加/删除直连节点（会修改 config.json 并重启服务，修改前自动备份）
+manage_direct() {
+    load_env || return 1
+    local bak ans
+    bak="${CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
+    if [ "$DIRECT_ENABLED" = "true" ]; then
+        echo "当前已有直连节点(出口本机)，端口: $DIRECT_PORT，名称: $DIRECT_NAME"
+        read -r -p "是否删除该直连节点?(y/N): " ans
+        [[ "$ans" =~ ^[Yy]$ ]] || { info "已取消"; return 0; }
+        cp "$CONFIG" "$bak"
+        remove_direct_config
+        DIRECT_ENABLED=false; DIRECT_PORT=""; DIRECT_UUID=""; DIRECT_NAME=""
+    else
+        ask_direct
+        cp "$CONFIG" "$bak"
+        apply_direct_config
+    fi
+    if ! check_config; then
+        err "新配置校验失败，已还原: $bak"
+        cp "$bak" "$CONFIG"
+        return 1
+    fi
+    info "配置已备份到: $bak，正在重启 sing-box..."
+    svc_restart || warn "重启失败，请检查: sing-box check -c $CONFIG"
+    save_env
+    build_link
+    show_link
+    [ "$DIRECT_ENABLED" = "true" ] && warn "记得在云厂商安全组/防火墙放行直连端口 $DIRECT_PORT (TCP)"
+    return 0
 }
 
 # ===== 入口：参数 / 已安装时的菜单 =====
@@ -1716,8 +1881,9 @@ MODE="${1:-}"
 case "$MODE" in
     rename) rename_node; exit $? ;;
     show|link) show_link; exit $? ;;
+    direct) manage_direct; exit $? ;;
     install|"") ;;
-    *) err "未知参数: $MODE（可用: install | rename | show）"; exit 1 ;;
+    *) err "未知参数: $MODE（可用: install | rename | show | direct）"; exit 1 ;;
 esac
 
 if [ -z "$MODE" ] && [ -f "$RELAY_ENV" ]; then
@@ -1725,12 +1891,14 @@ if [ -z "$MODE" ] && [ -f "$RELAY_ENV" ]; then
     echo "1) 重新安装（会覆盖 /etc/sing-box/config.json，旧文件自动备份）"
     echo "2) 修改节点名称"
     echo "3) 查看链接"
+    echo "4) 添加/删除直连节点(出口本机)"
     echo "0) 退出"
     read -r -p "请选择: " choice
     case "$choice" in
         1) ;;
         2) rename_node; exit $? ;;
         3) show_link; exit $? ;;
+        4) manage_direct; exit $? ;;
         *) exit 0 ;;
     esac
 fi
@@ -1771,29 +1939,29 @@ if [ -z "$REALITY_PK" ] || [ -z "$REALITY_PUB" ]; then
     exit 1
 fi
 
-while true; do
-    read -r -p "请输入线路机监听端口(留空随机 20000-65000): " USER_PORT
-    LISTEN_PORT="${USER_PORT:-$(shuf -i 20000-65000 -n 1 2>/dev/null || echo 20443)}"
-    if [[ "$LISTEN_PORT" =~ ^[0-9]{1,5}$ ]] && [ "$LISTEN_PORT" -ge 1 ] && [ "$LISTEN_PORT" -le 65535 ]; then
-        break
-    fi
-    err "端口无效: $LISTEN_PORT"
-done
+ask_port "请输入线路机(中转节点)监听端口(留空随机 20000-65000): " ""
+LISTEN_PORT="$ASKED_PORT"
 
 PUB_IP=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null | tr -d '[:space:]' || true)
 [ -z "$PUB_IP" ] && PUB_IP="YOUR_RELAY_IP"
 set_pub_ip_uri
 
 DEFAULT_NAME="中转-$PUB_IP"
-read -r -p "请输入节点名称/备注(显示在链接 # 后，回车默认「$DEFAULT_NAME」): " NODE_NAME
+read -r -p "请输入中转节点名称/备注(显示在链接 # 后，回车默认「$DEFAULT_NAME」): " NODE_NAME
 NODE_NAME="${NODE_NAME:-$DEFAULT_NAME}"
+
+echo ""
+read -r -p "是否同时添加一个本机(线路机)直连出口的 VLESS Reality 节点? (y/N): " ADD_DIRECT
+if [[ "$ADD_DIRECT" =~ ^[Yy]$ ]]; then
+    ask_direct
+fi
 
 mkdir -p /etc/sing-box
 
-if [ -f /etc/sing-box/config.json ]; then
-    BAK="/etc/sing-box/config.json.bak.$(date +%Y%m%d%H%M%S)"
-    warn "将覆盖已有的 /etc/sing-box/config.json，旧配置已备份到: $BAK"
-    cp /etc/sing-box/config.json "$BAK"
+if [ -f "$CONFIG" ]; then
+    BAK="${CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
+    warn "将覆盖已有的 $CONFIG，旧配置已备份到: $BAK"
+    cp "$CONFIG" "$BAK"
 fi
 
 # 用 jq 生成配置，避免密码中的特殊字符破坏 JSON
@@ -1840,7 +2008,13 @@ jq -n \
     { "type": "direct", "tag": "direct-out" }
   ],
   "route": { "rules": [{ "inbound": "vless-in", "outbound": "relay-out" }] }
-}' > /etc/sing-box/config.json
+}' > "$CONFIG"
+
+if [ "$DIRECT_ENABLED" = "true" ]; then
+    apply_direct_config
+fi
+
+check_config || warn "sing-box 配置校验未通过，请检查: sing-box check -c $CONFIG"
 
 if [ "$OS" = "alpine" ]; then
     cat > /etc/init.d/sing-box <<'SVC'
@@ -1889,8 +2063,13 @@ info "✅ 安装完成"
 show_link
 echo ""
 info "💡 链接已保存到: $RELAY_URI_FILE"
-info "💡 查看链接命令: cat $RELAY_URI_FILE"
-info "💡 修改节点名称: bash $SELF_COPY rename"
+info "💡 查看链接: bash $SELF_COPY show    修改节点名称: bash $SELF_COPY rename"
+info "💡 添加/删除直连节点: bash $SELF_COPY direct"
+if [ "$DIRECT_ENABLED" = "true" ]; then
+    warn "请在云厂商安全组/防火墙(如 Oracle Security List)放行两个端口(TCP): 中转 $LISTEN_PORT 和 直连 $DIRECT_PORT"
+else
+    warn "请在云厂商安全组/防火墙(如 Oracle Security List)放行端口(TCP): $LISTEN_PORT"
+fi
 RELAY_EOF
 
     # 替换占位符（INBOUND_IP/PORT/METHOD/PASSWORD 同时替换 REALITY_SNI）
@@ -1932,12 +2111,13 @@ RELAY_EOF
     echo "   (见本输出最后一行)"
     echo ""
     echo "3. 脚本运行中询问「监听端口」「节点名称」时直接回车使用默认值即可。"
+    echo "   运行中会问「是否同时添加一个本机(线路机)直连出口的 VLESS Reality 节点?」，不需要就回车(默认 N)。"
     echo "4. 完成后会显示 vless:// 链接（也保存在线路机 /etc/sing-box/relay_uri.txt）："
     echo "   复制到 Shadowrocket(小火箭) 添加节点即可，不需要设置「代理通过」。"
-    echo "5. 在线路机的云厂商安全组/防火墙(如 Oracle 的 Security List)放行该监听端口(TCP)。"
+    echo "5. 在线路机的云厂商安全组/防火墙(如 Oracle 的 Security List)放行监听端口(TCP)；若添加了直连节点，两个端口都要放行。"
     echo ""
     warn "线路机脚本会覆盖线路机上已有的 /etc/sing-box/config.json（自动备份为 config.json.bak.时间戳）"
-    info "之后在线路机修改节点名称: bash /root/relay-install.sh rename   查看链接: bash /root/relay-install.sh show"
+    info "之后在线路机: 修改名称 bash /root/relay-install.sh rename | 查看链接 … show | 添加/删除直连节点 … direct"
     echo "=========================================================="
     echo ""
 
