@@ -1604,7 +1604,7 @@ action_generate_relay() {
     fi
 
     PUBLIC_IP="$INBOUND_IP"
-    RELAY_SCRIPT="/tmp/relay-install.sh"
+    RELAY_SCRIPT="/root/relay-install.sh"
 
     info "正在生成线路机脚本: $RELAY_SCRIPT"
 
@@ -1880,22 +1880,60 @@ RELAY_EOF
     sed -i "s|__INBOUND_PASSWORD__|$(sed_sq_escape "$SS_PSK")|g" "$RELAY_SCRIPT"
     sed -i "s|__REALITY_SNI__|$(sed_sq_escape "${REALITY_SNI:-addons.mozilla.org}")|g" "$RELAY_SCRIPT"
 
-    chmod +x "$RELAY_SCRIPT"
+    # 脚本内含落地机 SS 密码，仅 root 可读；/tmp 留一份兼容旧用法
+    chmod 600 "$RELAY_SCRIPT"
+    cp "$RELAY_SCRIPT" /tmp/relay-install.sh 2>/dev/null && chmod 600 /tmp/relay-install.sh || true
 
-    info "✅ 线路机脚本已生成: $RELAY_SCRIPT"
+    # 检测落地机 SSH 端口（NAT 机器上应为商家映射的 SSH 端口）
+    local SSH_PORT RELAY_B64 SSH_HOST show_full
+    SSH_PORT=$(sshd -T 2>/dev/null | awk '/^port /{print $2;exit}' || true)
+    if [ -z "$SSH_PORT" ]; then
+        SSH_PORT=$(grep -Ei '^[[:space:]]*Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2;exit}' || true)
+    fi
+    SSH_PORT="${SSH_PORT:-22}"
+    SSH_HOST="$INBOUND_IP"
+    RELAY_B64=$(base64 -w0 "$RELAY_SCRIPT" 2>/dev/null || base64 "$RELAY_SCRIPT" | tr -d '\n')
+
     echo ""
-    info "请复制以下内容到线路机执行:"
-    echo "----------------------------------------"
-    cat "$RELAY_SCRIPT"
-    echo "----------------------------------------"
+    info "✅ 线路机脚本已生成并保存到本机(落地机): $RELAY_SCRIPT"
     echo ""
-    info "在线路机执行命令示例："
-    echo "   nano /root/relay-install.sh 粘贴保存后执行"
-    echo "   bash /root/relay-install.sh"
+    echo "================ 接下来在【线路机】上操作 ================"
+    echo "1. 用 SSH 登录【线路机】(不是本机)，切换到 root。"
+    echo "2. 任选下面一种方法，把整行命令复制到线路机执行："
     echo ""
-    warn "注意: 线路机脚本会覆盖线路机上已有的 /etc/sing-box/config.json（会自动备份为 config.json.bak.时间戳）"
-    info "之后修改节点名称: bash /root/relay-install.sh rename   (或 bash /etc/sing-box/relay-install.sh rename)"
-    info "复制执行完成后，即可在线路机完成 sing-box 中转节点部署。"
+    echo "   【方法一(推荐)】线路机通过 SSH 从落地机拉取脚本并执行:"
+    echo ""
+    echo "ssh -p ${SSH_PORT} root@${SSH_HOST} \"cat /root/relay-install.sh\" > /root/relay-install.sh && bash /root/relay-install.sh"
+    echo ""
+    echo "   - ${SSH_PORT} 是本机(落地机)的 SSH 端口；NAT 机器请确认是商家映射的 SSH 端口，不对就改成商家给的端口"
+    echo "   - 首次连接会问 Are you sure you want to continue connecting，输入 yes 回车"
+    echo "   - 然后输入【落地机】的 root 密码（输入时屏幕不显示任何字符，属正常），回车"
+    echo ""
+    echo "   【方法二】不用 SSH，复制下面这一整行（很长，务必完整复制）到线路机执行:"
+    echo "   (见本输出最后一行)"
+    echo ""
+    echo "3. 脚本运行中询问「监听端口」「节点名称」时直接回车使用默认值即可。"
+    echo "4. 完成后会显示 vless:// 链接（也保存在线路机 /etc/sing-box/relay_uri.txt）："
+    echo "   复制到 Shadowrocket(小火箭) 添加节点即可，不需要设置「代理通过」。"
+    echo "5. 在线路机的云厂商安全组/防火墙(如 Oracle 的 Security List)放行该监听端口(TCP)。"
+    echo ""
+    warn "线路机脚本会覆盖线路机上已有的 /etc/sing-box/config.json（自动备份为 config.json.bak.时间戳）"
+    info "之后在线路机修改节点名称: bash /root/relay-install.sh rename   查看链接: bash /root/relay-install.sh show"
+    echo "=========================================================="
+    echo ""
+
+    read -r -p "是否显示完整脚本内容?(y/N): " show_full
+    if [[ "$show_full" =~ ^[Yy]$ ]]; then
+        echo "----------------------------------------"
+        cat "$RELAY_SCRIPT"
+        echo "----------------------------------------"
+        echo ""
+    fi
+
+    info "【方法二】整行复制到线路机执行:"
+    echo ""
+    echo "echo '${RELAY_B64}' | base64 -d > /root/relay-install.sh && bash /root/relay-install.sh"
+    echo ""
 }
 
 # 动态生成菜单

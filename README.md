@@ -19,6 +19,12 @@
 >   - `bash /root/relay-install.sh rename`（或 `bash /etc/sing-box/relay-install.sh rename`）
 >   - `bash /root/relay-install.sh show` 查看链接
 >   - 已安装过时直接运行脚本会出现菜单：1. 重新安装 2. 修改节点名称 3. 查看链接
+> - **一条命令部署线路机**：落地机执行 `sb` → 选「生成线路机脚本」后，脚本保存在落地机 `/root/relay-install.sh`（权限 600），默认不再刷屏输出整个脚本，而是给出分步说明和两种整行复制的方法：
+>   - 方法一（推荐，在线路机执行）：`ssh -p <落地机SSH端口> root@<落地机入口IP> "cat /root/relay-install.sh" > /root/relay-install.sh && bash /root/relay-install.sh`
+>     （SSH 端口自动检测；NAT 机器请用商家映射的 SSH 端口；首次连接输入 yes，再输入落地机 root 密码，输入时不显示）
+>   - 方法二：输出最后一行的 `echo '<base64>' | base64 -d > /root/relay-install.sh && bash /root/relay-install.sh`，整行复制到线路机执行即可
+>   - 运行时端口/名称直接回车用默认值；把得到的 vless:// 链接导入 Shadowrocket，无需设置「代理通过」；记得在线路机云厂商安全组（如 Oracle）放行监听端口
+>   - 如需查看完整脚本，生成时在「是否显示完整脚本内容?(y/N)」处输入 y
 
 
 一个强大的 Sing-box 自动化部署工具，支持SS/HY2/TUIC/VLESS Reality/AnyTLS Reality 协议自选部署和线路机 VLESS Reality 中转的完整解决方案。
