@@ -156,6 +156,125 @@ install_deps() {
 install_deps
 
 # -----------------------
+# ---- 公网 IP / NAT / WARP 检测（安装脚本与 sb 面板共用同一套逻辑）----
+is_ipv4() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
+is_ipv6() { [[ "$1" =~ ^[0-9A-Fa-f:.]+$ ]] && [[ "$1" == *:*:* ]]; }
+
+# 内网/运营商级 NAT 地址: 10/8 172.16/12 192.168/16 100.64/10
+is_private_ipv4() {
+    local a b
+    is_ipv4 "$1" || return 1
+    a=$(printf '%s' "$1" | cut -d. -f1); b=$(printf '%s' "$1" | cut -d. -f2)
+    [ "$a" -eq 10 ] && return 0
+    [ "$a" -eq 172 ] && [ "$b" -ge 16 ] && [ "$b" -le 31 ] && return 0
+    [ "$a" -eq 192 ] && [ "$b" -eq 168 ] && return 0
+    [ "$a" -eq 100 ] && [ "$b" -ge 64 ] && [ "$b" -le 127 ] && return 0
+    return 1
+}
+
+# 查询公网出口 IP：$1=4 或 6；依次尝试多个接口（每个 5 秒超时），只接受合法 IP
+fetch_public_ip() {
+    local fam="$1" url ip urls
+    if [ "$fam" = "6" ]; then
+        urls="https://api64.ipify.org https://ipv6.icanhazip.com https://ifconfig.co/ip"
+    else
+        urls="https://api.ipify.org https://ipv4.icanhazip.com https://ifconfig.me/ip https://ipinfo.io/ip"
+    fi
+    for url in $urls; do
+        ip=$(curl -"$fam" -s --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]' || true)
+        if [ "$fam" = "6" ]; then is_ipv6 "$ip" && { printf '%s' "$ip"; return 0; }
+        else is_ipv4 "$ip" && { printf '%s' "$ip"; return 0; }; fi
+    done
+    return 1
+}
+
+# 默认路由网卡上的本机 IPv4 地址（ip route show default → ip addr；失败再用 ip route get）
+local_route_ip4() {
+    local dev addr=""
+    command -v ip >/dev/null 2>&1 || return 0
+    dev=$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' || true)
+    if [ -n "$dev" ]; then
+        addr=$(ip -4 addr show dev "$dev" 2>/dev/null | awk '/inet /{sub(/\/.*/,"",$2); print $2; exit}' || true)
+    fi
+    if [ -z "$addr" ]; then
+        addr=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)
+    fi
+    printf '%s' "$addr"
+}
+
+# 检测连接 IP。结果:
+#   DETECTED_IP / DETECTED_FAMILY(4|6) / DETECTED_ORG(运营商/ASN，可能为空)
+#   NAT_REASON：非空表示看起来是 NAT 或 WARP，检测到的 IP 不能直接用作节点连接地址
+detect_public_ip() {
+    DETECTED_IP=""; DETECTED_FAMILY=""; DETECTED_ORG=""; NAT_REASON=""
+    local ip4="" ip6="" trace local4
+    ip4=$(fetch_public_ip 4 || true)
+    if [ -n "$ip4" ]; then
+        DETECTED_IP="$ip4"; DETECTED_FAMILY=4
+    else
+        ip6=$(fetch_public_ip 6 || true)
+        [ -n "$ip6" ] || return 1
+        DETECTED_IP="$ip6"; DETECTED_FAMILY=6
+    fi
+    trace=$(curl -"$DETECTED_FAMILY" -s --max-time 5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
+    DETECTED_ORG=$(curl -s --max-time 5 "https://ipinfo.io/${DETECTED_IP}/org" 2>/dev/null | head -n1 | tr -d '\r' || true)
+    case "$DETECTED_ORG" in *"{"*|*"<"*) DETECTED_ORG="" ;; esac
+    if printf '%s\n' "$trace" | grep -qE '^warp=(on|plus)$'; then
+        NAT_REASON="出口走的是 Cloudflare WARP（cdn-cgi/trace 显示 $(printf '%s\n' "$trace" | grep -E '^warp=' | head -n1)），检测到的 ${DETECTED_IP} 是 Cloudflare 的 IP，客户端连不上"
+    elif printf '%s' "$DETECTED_ORG" | grep -qiE 'cloudflare|AS13335'; then
+        NAT_REASON="检测到的出口 IP ${DETECTED_IP} 属于 Cloudflare（${DETECTED_ORG}），通常是开了 WARP，客户端连不上"
+    elif [ "$DETECTED_FAMILY" = "4" ]; then
+        local4=$(local_route_ip4)
+        if [ -n "$local4" ] && is_private_ipv4 "$local4" && [ "$local4" != "$ip4" ]; then
+            NAT_REASON="本机网卡地址是内网 IP（${local4}），和检测到的公网出口 IP（${ip4}）不一样，说明本机在 NAT 后面（NAT 小鸡/转发机，或云厂商的 1:1 NAT）"
+        fi
+    fi
+    return 0
+}
+
+# 打印 NAT/WARP 说明
+explain_nat() {
+    warn "=================== ⚠️ 注意：不能自动使用检测到的 IP ==================="
+    warn "$NAT_REASON"
+    echo "   节点链接里必须填【入口地址】：也就是你平时 SSH 登录这台机器用的 IP，"
+    echo "   或商家面板里给的 NAT 入口 IP / 域名（例如 'nat.xxx.com' 或 '45.x.x.x'）。"
+    echo "   如果你确认 ${DETECTED_IP:-检测到的IP} 就是 SSH 登录用的 IP（例如 Oracle/AWS/GCP 这类云厂商，网卡是内网 IP 属正常），"
+    echo "   直接把它输入进去即可。"
+    warn "========================================================================"
+}
+
+# 生成链接用的主机：去掉空白/方括号，IPv6 加方括号
+uri_host() {
+    local h
+    h=$(printf '%s' "$1" | tr -d '[:space:]')
+    h="${h#[}"; h="${h%]}"
+    if [[ "$h" == *:* ]]; then printf '[%s]' "$h"; else printf '%s' "$h"; fi
+}
+
+# 规范化主机：去空白、去掉 IPv6 方括号
+normalize_host() {
+    local h
+    h=$(printf '%s' "$1" | tr -d '[:space:]')
+    h="${h#[}"
+    h="${h%]}"
+    printf '%s' "$h"
+}
+
+# 校验主机：IPv4 / IPv6 / 含字母和点的域名
+validate_host() {
+    local h="$1" o
+    [ -z "$h" ] && return 1
+    if [[ "$h" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+        for o in "${BASH_REMATCH[@]:1}"; do
+            [ "$((10#$o))" -le 255 ] || return 1
+        done
+        return 0
+    fi
+    is_ipv6 "$h" && return 0
+    [[ "$h" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]] && [[ "$h" =~ [A-Za-z] ]]
+}
+
+# -----------------------
 # 工具函数
 # 生成随机端口
 rand_port() {
@@ -290,10 +409,44 @@ select_ss_method
 
 # -----------------------
 # 在获取公网 IP 之前，询问连接ip和sni配置
+# 节点连接地址：留空时自动检测；检测到 NAT/WARP 时不自动填，必须由用户输入入口地址
+# 重装时沿用上次保存的 CUSTOM_IP（回车即可）
+OLD_CUSTOM_IP=""
+if [ -f /etc/sing-box/.config_cache ]; then
+    # shellcheck disable=SC1091
+    OLD_CUSTOM_IP=$( (. /etc/sing-box/.config_cache >/dev/null 2>&1; printf '%s' "${CUSTOM_IP:-}") || true)
+fi
+DETECTED_IP=""; DETECTED_FAMILY=""; DETECTED_ORG=""; NAT_REASON=""
 echo ""
-echo "请输入节点连接 IP 或 DDNS域名(留空默认出口IP):"
-read -r CUSTOM_IP
+if [ -n "$OLD_CUSTOM_IP" ]; then
+    echo "请输入节点连接 IP 或 DDNS域名(回车使用上次保存的 ${OLD_CUSTOM_IP}):"
+else
+    echo "请输入节点连接 IP 或 DDNS域名(留空自动检测出口IP；NAT 机器请填商家给的入口IP/域名):"
+fi
+read -r CUSTOM_IP || CUSTOM_IP=""
 CUSTOM_IP="$(echo "$CUSTOM_IP" | tr -d '[:space:]')"
+[ -z "$CUSTOM_IP" ] && CUSTOM_IP="$OLD_CUSTOM_IP"
+while true; do
+    if [ -n "$CUSTOM_IP" ]; then
+        if validate_host "$(normalize_host "$CUSTOM_IP")"; then
+            break
+        fi
+        err "地址无效: '${CUSTOM_IP}'（需为 IPv4、IPv6 或域名）"
+    else
+        info "正在检测公网 IP（IPv4 优先，其次 IPv6）..."
+        if ! detect_public_ip; then
+            warn "无法自动检测到公网 IP（网络不通或检测接口被墙），请手动输入入口地址"
+        elif [ -n "$NAT_REASON" ]; then
+            explain_nat
+        else
+            info "检测到公网 IP: ${DETECTED_IP}${DETECTED_ORG:+ (${DETECTED_ORG})}"
+            break
+        fi
+    fi
+    echo "请输入节点连接 IP 或域名(商家面板里的入口地址):"
+    read -r CUSTOM_IP || { err "没有读到输入，退出"; exit 1; }
+    CUSTOM_IP="$(echo "$CUSTOM_IP" | tr -d '[:space:]')"
+done
 
 # 如果用户选择了 Reality 协议，询问 server_name(SNI)
 REALITY_SNI=""
@@ -895,35 +1048,16 @@ SYSTEMD
 setup_service
 
 # -----------------------
-# 获取公网 IP
-get_public_ip() {
-    local ip=""
-    for url in \
-        "https://api.ipify.org" \
-        "https://ipinfo.io/ip" \
-        "https://ifconfig.me" \
-        "https://icanhazip.com" \
-        "https://ipecho.net/plain"; do
-        ip=$(curl -s --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]' || true)
-        if [ -n "$ip" ] && [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "$ip"
-            return 0
-        fi
-    done
-    return 1
-}
-
-# 如果用户提供了 CUSTOM_IP，则优先使用；否则自动检测出口 IP
+# 节点连接地址：用户填写的 CUSTOM_IP 优先，否则用前面检测到的公网 IP（IPv6 在链接里自动加方括号）
 if [ -n "${CUSTOM_IP:-}" ]; then
     PUB_IP="$CUSTOM_IP"
     info "使用用户提供的连接IP或ddns域名 : $PUB_IP"
+elif [ -n "${DETECTED_IP:-}" ]; then
+    PUB_IP="$DETECTED_IP"
+    info "检测到公网 IP: $PUB_IP"
 else
-    PUB_IP=$(get_public_ip || echo "YOUR_SERVER_IP")
-    if [ "$PUB_IP" = "YOUR_SERVER_IP" ]; then
-        warn "无法获取公网 IP,请手动替换"
-    else
-        info "检测到公网 IP: $PUB_IP"
-    fi
+    PUB_IP="YOUR_SERVER_IP"
+    warn "无法获取公网 IP,请手动替换"
 fi
 
 # -----------------------
@@ -941,7 +1075,8 @@ cert_sha256_hex() {
 # -----------------------
 # 生成链接(仅生成已选择的协议)
 generate_uris() {
-    local host="$PUB_IP"
+    local host
+    host=$(uri_host "$PUB_IP")
     
     if $ENABLE_SS; then
         local ss_userinfo="${SS_METHOD}:${PSK_SS}"
@@ -1200,17 +1335,142 @@ if [ "${ENABLE_ANYTLS:-false}" = "true" ]; then
 fi
 }
 
-# 获取公网IP（原始方法；仅接受合法 IP，避免把错误页面当成 IP）
-get_public_ip() {
-    local ip=""
-    for url in "https://api.ipify.org" "https://ipinfo.io/ip" "https://ifconfig.me"; do
-        ip=$(curl -s --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]' || true)
-        if [ -n "$ip" ] && validate_host "$ip"; then
-            echo "$ip"
-            return 0
-        fi
+# ---- 公网 IP / NAT / WARP 检测（安装脚本与 sb 面板共用同一套逻辑）----
+is_ipv4() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
+is_ipv6() { [[ "$1" =~ ^[0-9A-Fa-f:.]+$ ]] && [[ "$1" == *:*:* ]]; }
+
+# 内网/运营商级 NAT 地址: 10/8 172.16/12 192.168/16 100.64/10
+is_private_ipv4() {
+    local a b
+    is_ipv4 "$1" || return 1
+    a=$(printf '%s' "$1" | cut -d. -f1); b=$(printf '%s' "$1" | cut -d. -f2)
+    [ "$a" -eq 10 ] && return 0
+    [ "$a" -eq 172 ] && [ "$b" -ge 16 ] && [ "$b" -le 31 ] && return 0
+    [ "$a" -eq 192 ] && [ "$b" -eq 168 ] && return 0
+    [ "$a" -eq 100 ] && [ "$b" -ge 64 ] && [ "$b" -le 127 ] && return 0
+    return 1
+}
+
+# 查询公网出口 IP：$1=4 或 6；依次尝试多个接口（每个 5 秒超时），只接受合法 IP
+fetch_public_ip() {
+    local fam="$1" url ip urls
+    if [ "$fam" = "6" ]; then
+        urls="https://api64.ipify.org https://ipv6.icanhazip.com https://ifconfig.co/ip"
+    else
+        urls="https://api.ipify.org https://ipv4.icanhazip.com https://ifconfig.me/ip https://ipinfo.io/ip"
+    fi
+    for url in $urls; do
+        ip=$(curl -"$fam" -s --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]' || true)
+        if [ "$fam" = "6" ]; then is_ipv6 "$ip" && { printf '%s' "$ip"; return 0; }
+        else is_ipv4 "$ip" && { printf '%s' "$ip"; return 0; }; fi
     done
-    echo "YOUR_SERVER_IP"
+    return 1
+}
+
+# 默认路由网卡上的本机 IPv4 地址（ip route show default → ip addr；失败再用 ip route get）
+local_route_ip4() {
+    local dev addr=""
+    command -v ip >/dev/null 2>&1 || return 0
+    dev=$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' || true)
+    if [ -n "$dev" ]; then
+        addr=$(ip -4 addr show dev "$dev" 2>/dev/null | awk '/inet /{sub(/\/.*/,"",$2); print $2; exit}' || true)
+    fi
+    if [ -z "$addr" ]; then
+        addr=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)
+    fi
+    printf '%s' "$addr"
+}
+
+# 检测连接 IP。结果:
+#   DETECTED_IP / DETECTED_FAMILY(4|6) / DETECTED_ORG(运营商/ASN，可能为空)
+#   NAT_REASON：非空表示看起来是 NAT 或 WARP，检测到的 IP 不能直接用作节点连接地址
+detect_public_ip() {
+    DETECTED_IP=""; DETECTED_FAMILY=""; DETECTED_ORG=""; NAT_REASON=""
+    local ip4="" ip6="" trace local4
+    ip4=$(fetch_public_ip 4 || true)
+    if [ -n "$ip4" ]; then
+        DETECTED_IP="$ip4"; DETECTED_FAMILY=4
+    else
+        ip6=$(fetch_public_ip 6 || true)
+        [ -n "$ip6" ] || return 1
+        DETECTED_IP="$ip6"; DETECTED_FAMILY=6
+    fi
+    trace=$(curl -"$DETECTED_FAMILY" -s --max-time 5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
+    DETECTED_ORG=$(curl -s --max-time 5 "https://ipinfo.io/${DETECTED_IP}/org" 2>/dev/null | head -n1 | tr -d '\r' || true)
+    case "$DETECTED_ORG" in *"{"*|*"<"*) DETECTED_ORG="" ;; esac
+    if printf '%s\n' "$trace" | grep -qE '^warp=(on|plus)$'; then
+        NAT_REASON="出口走的是 Cloudflare WARP（cdn-cgi/trace 显示 $(printf '%s\n' "$trace" | grep -E '^warp=' | head -n1)），检测到的 ${DETECTED_IP} 是 Cloudflare 的 IP，客户端连不上"
+    elif printf '%s' "$DETECTED_ORG" | grep -qiE 'cloudflare|AS13335'; then
+        NAT_REASON="检测到的出口 IP ${DETECTED_IP} 属于 Cloudflare（${DETECTED_ORG}），通常是开了 WARP，客户端连不上"
+    elif [ "$DETECTED_FAMILY" = "4" ]; then
+        local4=$(local_route_ip4)
+        if [ -n "$local4" ] && is_private_ipv4 "$local4" && [ "$local4" != "$ip4" ]; then
+            NAT_REASON="本机网卡地址是内网 IP（${local4}），和检测到的公网出口 IP（${ip4}）不一样，说明本机在 NAT 后面（NAT 小鸡/转发机，或云厂商的 1:1 NAT）"
+        fi
+    fi
+    return 0
+}
+
+# 打印 NAT/WARP 说明
+explain_nat() {
+    warn "=================== ⚠️ 注意：不能自动使用检测到的 IP ==================="
+    warn "$NAT_REASON"
+    echo "   节点链接里必须填【入口地址】：也就是你平时 SSH 登录这台机器用的 IP，"
+    echo "   或商家面板里给的 NAT 入口 IP / 域名（例如 'nat.xxx.com' 或 '45.x.x.x'）。"
+    echo "   如果你确认 ${DETECTED_IP:-检测到的IP} 就是 SSH 登录用的 IP（例如 Oracle/AWS/GCP 这类云厂商，网卡是内网 IP 属正常），"
+    echo "   直接把它输入进去即可。"
+    warn "========================================================================"
+}
+
+# 生成链接用的主机：去掉空白/方括号，IPv6 加方括号
+uri_host() {
+    local h
+    h=$(printf '%s' "$1" | tr -d '[:space:]')
+    h="${h#[}"; h="${h%]}"
+    if [[ "$h" == *:* ]]; then printf '[%s]' "$h"; else printf '%s' "$h"; fi
+}
+
+# 兼容旧调用：只输出检测到的 IP（IPv4 优先，其次 IPv6），失败输出 YOUR_SERVER_IP
+get_public_ip() {
+    if detect_public_ip && [ -n "$DETECTED_IP" ]; then
+        echo "$DETECTED_IP"
+    else
+        echo "YOUR_SERVER_IP"
+    fi
+}
+
+# 决定节点链接用的地址，结果放在 PUBLIC_IP（已处理 IPv6 方括号）
+# 已保存的 CUSTOM_IP 优先（老安装不受影响）；否则自动检测，发现 NAT/WARP 时要求输入入口地址并保存
+resolve_link_ip() {
+    local input
+    if [ -n "${CUSTOM_IP:-}" ]; then
+        PUBLIC_IP=$(uri_host "$CUSTOM_IP")
+        return 0
+    fi
+    if detect_public_ip && [ -z "$NAT_REASON" ]; then
+        PUBLIC_IP=$(uri_host "$DETECTED_IP")
+        return 0
+    fi
+    if [ -n "$NAT_REASON" ]; then
+        explain_nat
+    else
+        warn "无法自动检测到公网 IP（网络不通或检测接口被墙）"
+    fi
+    if [ ! -t 0 ]; then
+        warn "当前不是交互终端，暂时使用 ${DETECTED_IP:-YOUR_SERVER_IP}；请运行 sb 后在提示处填写入口地址"
+        PUBLIC_IP=$(uri_host "${DETECTED_IP:-YOUR_SERVER_IP}")
+        return 0
+    fi
+    while true; do
+        read -r -p "请输入节点连接 IP 或域名(商家面板里的入口地址): " input || input=""
+        input=$(normalize_host "$input")
+        if validate_host "$input"; then break; fi
+        err "地址无效: '${input}'（需为 IPv4、IPv6 或域名）"
+    done
+    PUBLIC_IP=$(uri_host "$input")
+    cache_set CUSTOM_IP "$PUBLIC_IP"
+    CUSTOM_IP="$PUBLIC_IP"
+    info "已将入口地址 $PUBLIC_IP 保存为 CUSTOM_IP（以后生成链接都会用它）"
 }
 
 # 写入 KEY=VALUE 到指定文件：已存在的 KEY 会被替换而不是重复追加
@@ -1291,12 +1551,8 @@ mask_secret() {
 generate_uris() {
     read_config || return 1
 
-    # 优先使用用户自定义入口 IP
-    if [ -n "${CUSTOM_IP:-}" ]; then
-        PUBLIC_IP="$CUSTOM_IP"
-    else
-        PUBLIC_IP=$(get_public_ip)
-    fi
+    # 优先使用用户自定义入口 IP；否则自动检测（NAT/WARP 时要求输入入口地址）
+    resolve_link_ip
 
     node_suffix=$(cat /root/node_names.txt 2>/dev/null || echo "")
     
@@ -1696,7 +1952,9 @@ action_generate_relay() {
     # 落地机入口地址：NAT/转发机上自动检测到的通常是【出口IP】，客户端/线路机连不上，
     # 因此不再静默使用检测结果，必须由用户确认或输入商家提供的【入口IP/连接地址】
     local INBOUND_IP="" DETECTED_IP confirm input_ip SSH_PORT DETECTED_SSH_PORT input_ssh
-    DETECTED_IP="$(normalize_host "$(get_public_ip)")"
+    detect_public_ip || true
+    DETECTED_IP="$(normalize_host "${DETECTED_IP:-YOUR_SERVER_IP}")"
+    [ -n "${NAT_REASON:-}" ] && warn "$NAT_REASON"
     echo ""
     info "=== 设置落地机(本机)入口地址 ==="
     echo "   入口IP: 线路机/客户端连接本机用的地址（通常就是你 SSH 登录用的 IP，或商家给的 NAT 入口IP/域名）"
