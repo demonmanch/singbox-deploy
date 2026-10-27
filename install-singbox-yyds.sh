@@ -890,6 +890,16 @@ generate_cert() {
 generate_cert
 
 # -----------------------
+# sing-box 版本 >= $1.$2 ?
+singbox_at_least() {
+    local v maj min
+    v=$(sing-box version 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1 || true)
+    [ -n "$v" ] || return 1
+    maj=${v%%.*}; min=$(printf '%s' "$v" | cut -d. -f2)
+    [ "$maj" -gt "$1" ] || { [ "$maj" -eq "$1" ] && [ "$min" -ge "$2" ]; }
+}
+
+# -----------------------
 # 生成配置文件
 CONFIG_PATH="/etc/sing-box/config.json"
 
@@ -934,6 +944,7 @@ INBOUND_SS
           "password": "PSK_HY2_PLACEHOLDER"
         }
       ],
+      "ignore_client_bandwidth": true,
       "tls": {
         "enabled": true,
         "alpn": ["h3"],
@@ -944,6 +955,11 @@ INBOUND_SS
 INBOUND_HY2
         sed -i "s|PORT_HY2_PLACEHOLDER|$PORT_HY2|g" "$TEMP_INBOUNDS"
         sed -i "s|PSK_HY2_PLACEHOLDER|$PSK_HY2|g" "$TEMP_INBOUNDS"
+        # ignore_client_bandwidth（sing-box 1.11+）：未设置 up/down_mbps 时让客户端使用 BBR 拥塞控制，
+        # 不按客户端填写的带宽跑 Brutal。旧版 sing-box 不认识该字段，去掉以免配置校验失败
+        if ! singbox_at_least 1 11; then
+            sed -i '/"ignore_client_bandwidth"/d' "$TEMP_INBOUNDS"
+        fi
         need_comma=true
     fi
     
