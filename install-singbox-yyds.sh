@@ -977,6 +977,14 @@ create_config() {
 
     mkdir -p "$(dirname "$CONFIG_PATH")"
 
+    # 重装时先备份旧配置；新配置校验不通过就还原，避免把正在运行的节点弄坏
+    CONFIG_BAK=""
+    if [ -f "$CONFIG_PATH" ]; then
+        CONFIG_BAK="${CONFIG_PATH}.bak.$(date +%Y%m%d%H%M%S)"
+        cp "$CONFIG_PATH" "$CONFIG_BAK"
+        info "旧配置已备份到: $CONFIG_BAK"
+    fi
+
     # 构建 inbounds 内容（使用临时文件避免字符串处理问题）
     local TEMP_INBOUNDS="/tmp/singbox_inbounds_$.json"
     > "$TEMP_INBOUNDS"
@@ -1172,9 +1180,21 @@ CONFIG_TAIL
 
     rm -f "$TEMP_INBOUNDS"
 
-    sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1 \
-       && info "配置文件验证通过" \
-       || warn "配置文件验证失败,但继续执行"
+    local check_out
+    if check_out=$(sing-box check -c "$CONFIG_PATH" 2>&1); then
+        info "配置文件验证通过"
+    else
+        err "配置文件校验失败(sing-box check):"
+        printf '%s\n' "$check_out" | tail -n 20 >&2
+        if [ -n "$CONFIG_BAK" ]; then
+            cp "$CONFIG_BAK" "$CONFIG_PATH"
+            err "已还原旧配置($CONFIG_BAK)，服务未改动。请把上面的错误信息反馈给作者。"
+        else
+            mv "$CONFIG_PATH" "${CONFIG_PATH}.invalid"
+            err "错误的配置已保存为 ${CONFIG_PATH}.invalid，安装中止。"
+        fi
+        exit 1
+    fi
 
     # 保存配置缓存（追加/覆盖）
     cat > /etc/sing-box/.config_cache <<CACHEEOF
@@ -1318,7 +1338,7 @@ SYSTEMD
         systemctl enable sing-box >/dev/null 2>&1
         systemctl restart sing-box || {
             err "服务启动失败"
-            journalctl -u sing-box -n 30 --no-pager
+            journalctl -u sing-box -n 20 --no-pager 2>/dev/null || true
             exit 1
         }
         
@@ -1335,6 +1355,76 @@ SYSTEMD
 }
 
 setup_service
+
+# -----------------------
+# 安装后自检：服务状态、各端口监听(TCP/UDP)、Reality 目标握手
+show_service_logs() {
+    if [ "$OS" = "alpine" ]; then
+        tail -n 20 /var/log/sing-box.err 2>/dev/null || true
+        tail -n 20 /var/log/sing-box.log 2>/dev/null || true
+    else
+        journalctl -u sing-box -n 20 --no-pager 2>/dev/null || true
+    fi
+}
+
+check_listen() {
+    # $1=协议名 $2=端口 $3=tcp|udp
+    local NET
+    NET=$(printf '%s' "$3" | tr '[:lower:]' '[:upper:]')
+    if port_in_use "$2" "$3"; then
+        echo "   ✅ $1 端口 $2/${NET} 正在监听"
+    else
+        echo "   ❌ $1 端口 $2/${NET} 没有在监听"
+        SELF_CHECK_FAIL=1
+    fi
+}
+
+post_install_check() {
+    SELF_CHECK_FAIL=0
+    echo ""
+    info "=== 安装后自检 ==="
+    local active=false
+    if [ "$OS" = "alpine" ]; then
+        rc-service sing-box status >/dev/null 2>&1 && active=true
+    else
+        systemctl is-active sing-box >/dev/null 2>&1 && active=true
+    fi
+    if $active; then
+        echo "   ✅ sing-box 服务正在运行"
+    else
+        echo "   ❌ sing-box 服务没有运行，最近 20 行日志："
+        show_service_logs
+        SELF_CHECK_FAIL=1
+    fi
+    sleep 1
+    if ! command -v ss >/dev/null 2>&1 && ! command -v netstat >/dev/null 2>&1; then
+        warn "未找到 ss/netstat，跳过端口监听检查（Debian 可 apt-get install -y iproute2）"
+    else
+        $ENABLE_SS && { check_listen "SS" "$PORT_SS" tcp; check_listen "SS" "$PORT_SS" udp; }
+        $ENABLE_HY2 && check_listen "HY2" "$PORT_HY2" udp
+        $ENABLE_TUIC && check_listen "TUIC" "$PORT_TUIC" udp
+        $ENABLE_REALITY && check_listen "VLESS Reality" "$PORT_REALITY" tcp
+        $ENABLE_ANYTLS && check_listen "AnyTLS" "$PORT_ANYTLS" tcp
+        echo "   本机 sing-box 监听列表:"
+        if command -v ss >/dev/null 2>&1; then
+            ss -lntup 2>/dev/null | grep -E 'sing-box|^Netid' | sed 's/^/     /' || true
+        else
+            netstat -lntup 2>/dev/null | grep -E 'sing-box|^Proto' | sed 's/^/     /' || true
+        fi
+    fi
+    if $ENABLE_REALITY || $ENABLE_ANYTLS; then
+        reality_target_check "$REALITY_SNI" || true
+    fi
+    if [ "$SELF_CHECK_FAIL" -ne 0 ]; then
+        warn "自检发现问题（见上面 ❌），可以运行 sb 查看状态，或把上面的日志反馈给作者"
+    fi
+    echo ""
+    info "💡 从外网测试 TCP 端口是否通: 打开 https://www.itdog.cn/tcping/ 或 https://ping.pe/ ，输入 你的IP:端口"
+    info "💡 UDP 端口(HY2/TUIC)无法用 tcping 测试，请直接用客户端连接测试"
+    return 0
+}
+
+post_install_check
 
 # -----------------------
 # 节点连接地址：用户填写的 CUSTOM_IP 优先，否则用前面检测到的公网 IP（IPv6 在链接里自动加方括号）
