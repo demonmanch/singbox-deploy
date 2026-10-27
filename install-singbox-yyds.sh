@@ -835,7 +835,8 @@ restore_resolv() {
     [ -n "$RESOLV_BAK" ] || return 0
     case "$RESOLV_MODE" in
         mv)   rm -f /etc/resolv.conf; mv -f "$RESOLV_BAK" /etc/resolv.conf ;;
-        cp)   cat "$RESOLV_BAK" > /etc/resolv.conf; rm -f "$RESOLV_BAK" ;;
+        cp)   if cat "$RESOLV_BAK" > /etc/resolv.conf; then rm -f "$RESOLV_BAK"
+              else warn "恢复 /etc/resolv.conf 失败，原文件保存在 $RESOLV_BAK，请手动恢复"; fi ;;
         none) rm -f /etc/resolv.conf ;;
     esac
     RESOLV_BAK=""
@@ -876,11 +877,20 @@ check_ipv6_only_download() {
         RESOLV_MODE="none"
     elif mv /etc/resolv.conf "$RESOLV_BAK" 2>/dev/null; then
         RESOLV_MODE="mv"
+    elif cp /etc/resolv.conf "$RESOLV_BAK" 2>/dev/null; then
+        RESOLV_MODE="cp"
     else
-        cp /etc/resolv.conf "$RESOLV_BAK"; RESOLV_MODE="cp"
+        err "无法备份 /etc/resolv.conf，已放弃切换 DNS"
+        RESOLV_BAK=""
+        return 0
     fi
     trap restore_resolv EXIT
-    printf 'nameserver 2a00:1098:2b::1\nnameserver 2a01:4f8:c2c:123f::1\n' > /etc/resolv.conf
+    if ! printf 'nameserver 2a00:1098:2b::1\nnameserver 2a01:4f8:c2c:123f::1\n' > /etc/resolv.conf 2>/dev/null; then
+        err "无法写入 /etc/resolv.conf（可能被系统锁定），已放弃切换 DNS"
+        restore_resolv
+        trap - EXIT
+        return 0
+    fi
     info "已临时切换 DNS 到 NAT64（原文件备份为 $RESOLV_BAK，安装完成或脚本退出时自动恢复）"
 }
 
@@ -1396,10 +1406,22 @@ post_install_check() {
         show_service_logs
         SELF_CHECK_FAIL=1
     fi
-    sleep 1
     if ! command -v ss >/dev/null 2>&1 && ! command -v netstat >/dev/null 2>&1; then
         warn "未找到 ss/netstat，跳过端口监听检查（Debian 可 apt-get install -y iproute2）"
     else
+        # sing-box 启动时若 NTP(UDP 123)不通会多等约 10 秒才开始监听，这里最多等 20 秒
+        local waited=0 first_port=""
+        $ENABLE_SS && first_port="${PORT_SS} tcp"
+        [ -z "$first_port" ] && $ENABLE_REALITY && first_port="${PORT_REALITY} tcp"
+        [ -z "$first_port" ] && $ENABLE_ANYTLS && first_port="${PORT_ANYTLS} tcp"
+        [ -z "$first_port" ] && $ENABLE_HY2 && first_port="${PORT_HY2} udp"
+        [ -z "$first_port" ] && $ENABLE_TUIC && first_port="${PORT_TUIC} udp"
+        if [ -n "$first_port" ] && $active; then
+            while ! port_in_use "${first_port% *}" "${first_port#* }" && [ "$waited" -lt 20 ]; do
+                [ "$waited" -eq 0 ] && echo "   等待 sing-box 开始监听端口(最多 20 秒)..."
+                sleep 2; waited=$((waited + 2))
+            done
+        fi
         $ENABLE_SS && { check_listen "SS" "$PORT_SS" tcp; check_listen "SS" "$PORT_SS" udp; }
         $ENABLE_HY2 && check_listen "HY2" "$PORT_HY2" udp
         $ENABLE_TUIC && check_listen "TUIC" "$PORT_TUIC" udp
