@@ -491,79 +491,220 @@ rand_uuid() {
 }
 
 # -----------------------
+# 端口工具
+# 端口校验 1-65535
+validate_port() {
+    [[ "$1" =~ ^[0-9]{1,5}$ ]] && [ "$((10#$1))" -ge 1 ] && [ "$((10#$1))" -le 65535 ]
+}
+
+# 端口是否已被系统占用：$1=端口 $2=tcp|udp（ss 优先，Alpine/busybox 回退 netstat；都没有时视为未占用）
+port_in_use() {
+    local port="$1" flag="-lnt" out=""
+    [ "${2:-tcp}" = "udp" ] && flag="-lnu"
+    if command -v ss >/dev/null 2>&1; then
+        out=$(ss "$flag" 2>/dev/null | awk 'NR>1{print $4}' || true)
+    elif command -v netstat >/dev/null 2>&1; then
+        out=$(netstat "$flag" 2>/dev/null | awk '{print $4}' || true)
+    fi
+    printf '%s\n' "$out" | grep -qE "[:.]${port}\$"
+}
+
+# 本次安装已分配的端口（分 TCP/UDP 记录，值为协议名）
+# SS 同时用 TCP+UDP；HY2/TUIC 只用 UDP；Reality/AnyTLS 只用 TCP
+# 所以 Reality/AnyTLS 可以和 HY2/TUIC 使用同一个端口号
+declare -A USED_TCP=() USED_UDP=()
+NAT_RANGES=()
+NAT_PORT_RANGE=""
+
+# 解析商家端口范围，例如 "56566-56586" 或 "20001,20002 20005" 或混合；结果放 NAT_RANGES("低 高")
+parse_port_ranges() {
+    local item lo hi
+    NAT_RANGES=()
+    for item in $(printf '%s' "$1" | tr ',，;' '   '); do
+        if [[ "$item" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            lo="${BASH_REMATCH[1]}"; hi="${BASH_REMATCH[2]}"
+        elif [[ "$item" =~ ^[0-9]+$ ]]; then
+            lo="$item"; hi="$item"
+        else
+            return 1
+        fi
+        validate_port "$lo" && validate_port "$hi" || return 1
+        lo=$((10#$lo)); hi=$((10#$hi))
+        [ "$lo" -le "$hi" ] || return 1
+        NAT_RANGES+=("$lo $hi")
+    done
+    [ "${#NAT_RANGES[@]}" -gt 0 ]
+}
+
+port_in_ranges() {
+    local r lo hi
+    for r in "${NAT_RANGES[@]}"; do
+        lo=${r% *}; hi=${r#* }
+        [ "$1" -ge "$lo" ] && [ "$1" -le "$hi" ] && return 0
+    done
+    return 1
+}
+
+# 本次已分配端口中与 $1 冲突的协议名（$2=需要的网络 "tcp" "udp" 或 "tcp udp"）
+port_conflict() {
+    local n
+    for n in $2; do
+        if [ "$n" = "tcp" ] && [ -n "${USED_TCP[$1]:-}" ]; then printf '%s(TCP)' "${USED_TCP[$1]}"; return 0; fi
+        if [ "$n" = "udp" ] && [ -n "${USED_UDP[$1]:-}" ]; then printf '%s(UDP)' "${USED_UDP[$1]}"; return 0; fi
+    done
+    return 1
+}
+
+port_busy_os() {
+    local n
+    for n in $2; do port_in_use "$1" "$n" && return 0; done
+    return 1
+}
+
+# 随机挑一个可用端口：有商家端口范围时只在范围内挑
+pick_random_port() {
+    local nets="$1" p r lo hi
+    for _ in $(seq 1 300); do
+        if [ "${#NAT_RANGES[@]}" -gt 0 ]; then
+            r="${NAT_RANGES[$((RANDOM % ${#NAT_RANGES[@]}))]}"
+            lo=${r% *}; hi=${r#* }
+            p=$(shuf -i "${lo}-${hi}" -n 1 2>/dev/null || echo $((lo + RANDOM % (hi - lo + 1))))
+        else
+            p=$(rand_port)
+        fi
+        port_conflict "$p" "$nets" >/dev/null && continue
+        port_busy_os "$p" "$nets" && continue
+        printf '%s' "$p"
+        return 0
+    done
+    return 1
+}
+
+# 询问某协议端口：$1=协议名 $2=环境变量给定的端口(可空) $3=网络("tcp"/"udp"/"tcp udp")；结果 CHOSEN_PORT
+ask_proto_port() {
+    local label="$1" envval="$2" nets="$3" p ans hint conflict n
+    if [ "${#NAT_RANGES[@]}" -gt 0 ]; then
+        hint="留空则从商家端口范围 ${NAT_PORT_RANGE} 中随机"
+    else
+        hint="留空则随机 10000-60000"
+    fi
+    while true; do
+        if [ -n "$envval" ]; then
+            p="$envval"; envval=""
+        else
+            read -r -p "请输入 ${label} 端口(${hint}): " p || p=""
+            p=$(printf '%s' "$p" | tr -d '[:space:]')
+        fi
+        if [ -z "$p" ]; then
+            if ! p=$(pick_random_port "$nets"); then
+                err "没有找到可用的随机端口（商家端口范围可能已用完），请手动输入"
+                continue
+            fi
+        else
+            if ! validate_port "$p"; then
+                err "端口无效: '$p'（需为 1-65535 的数字）"
+                continue
+            fi
+            p=$((10#$p))
+            if conflict=$(port_conflict "$p" "$nets"); then
+                err "端口 $p 已被本次的 ${conflict} 使用，请换一个"
+                continue
+            fi
+            if [ "${#NAT_RANGES[@]}" -gt 0 ] && ! port_in_ranges "$p"; then
+                warn "端口 $p 不在你填写的商家端口范围(${NAT_PORT_RANGE})内，NAT 机器上外网很可能连不上"
+                read -r -p "仍然使用 $p ?(y/N): " ans || ans=""
+                [[ "$ans" =~ ^[Yy]$ ]] || continue
+            fi
+            if port_busy_os "$p" "$nets"; then
+                warn "端口 $p 已被本机程序占用（如果是旧的 sing-box 占用，重装后会自动释放，可以继续）"
+                read -r -p "仍然使用 $p ?(y/N): " ans || ans=""
+                [[ "$ans" =~ ^[Yy]$ ]] || continue
+            fi
+        fi
+        break
+    done
+    for n in $nets; do
+        if [ "$n" = "tcp" ]; then USED_TCP[$p]="$label"; else USED_UDP[$p]="$label"; fi
+    done
+    CHOSEN_PORT="$p"
+}
+
+udp_reminder() {
+    warn "$1 使用 UDP 端口 $2：NAT 机器必须确认商家把这个端口的【UDP】也映射了（很多 NAT 只映射 TCP），"
+    warn "   云厂商安全组/防火墙也要放行 UDP $2，否则 $1 连不上。"
+}
+
+# -----------------------
 # 配置端口和密码
 get_config() {
     info "开始配置端口和密码..."
-    
+
+    # NAT 模式：商家只给了一段端口时，随机端口只在这段范围里挑
+    NAT_PORT_RANGE="${SINGBOX_NAT_PORTS:-}"
+    if [ -z "$NAT_PORT_RANGE" ]; then
+        echo ""
+        echo "如果这是 NAT 机器(商家只给了部分端口，例如 56566-56586)，请输入商家给的端口范围，脚本只在其中随机选端口。"
+        echo "多个范围/端口用逗号分隔，例如: 56566-56586 或 20001,20002,20003 。普通 VPS 直接回车跳过。"
+        read -r -p "商家端口范围(回车跳过): " NAT_PORT_RANGE || NAT_PORT_RANGE=""
+    fi
+    while [ -n "$NAT_PORT_RANGE" ] && ! parse_port_ranges "$NAT_PORT_RANGE"; do
+        err "端口范围格式不对: '$NAT_PORT_RANGE'（例: 56566-56586 或 20001,20002）"
+        read -r -p "商家端口范围(回车跳过): " NAT_PORT_RANGE || NAT_PORT_RANGE=""
+    done
+    if [ -n "$NAT_PORT_RANGE" ]; then
+        info "NAT 模式：随机端口只从 ${NAT_PORT_RANGE} 中选择"
+        info "提示：Reality/AnyTLS(TCP) 和 HY2/TUIC(UDP) 可以使用同一个端口号；SS 同时占用该端口的 TCP 和 UDP"
+    fi
+
     if $ENABLE_SS; then
         info "=== 配置 Shadowsocks (SS) ==="
-        if [ -n "${SINGBOX_PORT_SS:-}" ]; then
-            PORT_SS="$SINGBOX_PORT_SS"
-        else
-            read -p "请输入 SS 端口(留空则随机 10000-60000): " USER_PORT_SS
-            PORT_SS="${USER_PORT_SS:-$(rand_port)}"
-        fi
+        ask_proto_port "SS" "${SINGBOX_PORT_SS:-}" "tcp udp"
+        PORT_SS="$CHOSEN_PORT"
         PSK_SS=$(rand_pass)
-        info "SS 端口: $PORT_SS"
+        info "SS 端口: $PORT_SS (TCP+UDP)"
         info "SS 加密方式: $SS_METHOD"
         info "SS 密码已自动生成"
     fi
 
     if $ENABLE_HY2; then
         info "=== 配置 Hysteria2 (HY2) ==="
-        if [ -n "${SINGBOX_PORT_HY2:-}" ]; then
-            PORT_HY2="$SINGBOX_PORT_HY2"
-        else
-            read -p "请输入 HY2 端口(留空则随机 10000-60000): " USER_PORT_HY2
-            PORT_HY2="${USER_PORT_HY2:-$(rand_port)}"
-        fi
+        ask_proto_port "HY2" "${SINGBOX_PORT_HY2:-}" "udp"
+        PORT_HY2="$CHOSEN_PORT"
         PSK_HY2=$(rand_pass)
-        info "HY2 端口: $PORT_HY2"
+        info "HY2 端口: $PORT_HY2 (UDP)"
         info "HY2 密码已自动生成"
+        udp_reminder "HY2" "$PORT_HY2"
     fi
 
     if $ENABLE_TUIC; then
         info "=== 配置 TUIC ==="
-        if [ -n "${SINGBOX_PORT_TUIC:-}" ]; then
-            PORT_TUIC="$SINGBOX_PORT_TUIC"
-        else
-            read -p "请输入 TUIC 端口(留空则随机 10000-60000): " USER_PORT_TUIC
-            PORT_TUIC="${USER_PORT_TUIC:-$(rand_port)}"
-        fi
+        ask_proto_port "TUIC" "${SINGBOX_PORT_TUIC:-}" "udp"
+        PORT_TUIC="$CHOSEN_PORT"
         PSK_TUIC=$(rand_pass)
         UUID_TUIC=$(rand_uuid)
-        info "TUIC 端口: $PORT_TUIC"
+        info "TUIC 端口: $PORT_TUIC (UDP)"
         info "TUIC UUID 和密码已自动生成"
+        udp_reminder "TUIC" "$PORT_TUIC"
     fi
 
     if $ENABLE_REALITY; then
         info "=== 配置 VLESS Reality ==="
-        if [ -n "${SINGBOX_PORT_REALITY:-}" ]; then
-            PORT_REALITY="$SINGBOX_PORT_REALITY"
-        else
-            read -p "请输入 VLESS Reality 端口(留空则随机 10000-60000): " USER_PORT_REALITY
-            PORT_REALITY="${USER_PORT_REALITY:-$(rand_port)}"
-        fi
+        ask_proto_port "VLESS Reality" "${SINGBOX_PORT_REALITY:-}" "tcp"
+        PORT_REALITY="$CHOSEN_PORT"
         UUID=$(rand_uuid)
-        info "VLESS Reality 端口: $PORT_REALITY"
+        info "VLESS Reality 端口: $PORT_REALITY (TCP)"
         info "VLESS Reality UUID 已自动生成"
     fi
-    
+
     if $ENABLE_ANYTLS; then
-    info "=== 配置 AnyTLS Reality ==="
-    if [ -n "${SINGBOX_PORT_ANYTLS:-}" ]; then
-        PORT_ANYTLS="$SINGBOX_PORT_ANYTLS"
-    else
-        read -p "请输入 AnyTLS Reality 端口(留空则随机 10000-60000): " USER_PORT_ANYTLS
-        PORT_ANYTLS="${USER_PORT_ANYTLS:-$(rand_port)}"
-    fi
-
-    ANYTLS_USER=$(openssl rand -hex 4)
-    ANYTLS_PSK=$(openssl rand -base64 16)
-
-    info "AnyTLS Reality 端口: $PORT_ANYTLS"
-    info "AnyTLS Reality 用户名: $ANYTLS_USER"
-    info "AnyTLS Reality 密码已自动生成"
+        info "=== 配置 AnyTLS Reality ==="
+        ask_proto_port "AnyTLS Reality" "${SINGBOX_PORT_ANYTLS:-}" "tcp"
+        PORT_ANYTLS="$CHOSEN_PORT"
+        ANYTLS_USER=$(openssl rand -hex 4)
+        ANYTLS_PSK=$(openssl rand -base64 16)
+        info "AnyTLS Reality 端口: $PORT_ANYTLS (TCP)"
+        info "AnyTLS Reality 用户名: $ANYTLS_USER"
+        info "AnyTLS Reality 密码已自动生成"
     fi
 
     info "配置完成，继续安装..."
@@ -993,6 +1134,8 @@ CACHEEOF
 
     # 全局写入 CUSTOM_IP（哪怕为空也写）
     echo "CUSTOM_IP=$CUSTOM_IP" >> /etc/sing-box/.config_cache
+    # NAT 模式下商家给的端口范围（仅作记录，方便以后查看）
+    printf 'NAT_PORT_RANGE=%q\n' "${NAT_PORT_RANGE:-}" >> /etc/sing-box/.config_cache
 
     info "配置缓存已保存到 /etc/sing-box/.config_cache"
 }
