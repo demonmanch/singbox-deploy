@@ -90,6 +90,35 @@ detect_virt
 check_kernel
 
 # -----------------------
+# 低内存检测：读取 cgroup 内存上限(容器/小鸡)和 /proc/meminfo，取较小值(MiB)
+detect_mem() {
+    local mem_kb lim lim_mib=""
+    mem_kb=$(awk '/^MemTotal:/{print $2; exit}' /proc/meminfo 2>/dev/null || true)
+    [ -n "$mem_kb" ] && lim_mib=$((mem_kb / 1024))
+    for f in /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory/memory.limit_in_bytes; do
+        lim=$(cat "$f" 2>/dev/null || true)
+        if [[ "$lim" =~ ^[0-9]+$ ]] && [ "$lim" -gt 0 ] && [ "$lim" -lt 1099511627776 ]; then
+            lim=$((lim / 1024 / 1024))
+            if [ -z "$lim_mib" ] || [ "$lim" -lt "$lim_mib" ]; then lim_mib="$lim"; fi
+        fi
+    done
+    MEM_MIB="${lim_mib:-0}"
+    LOW_MEM=false
+    GO_MEMLIMIT=""
+    if [ "$MEM_MIB" -gt 0 ] && [ "$MEM_MIB" -le 256 ]; then
+        LOW_MEM=true
+        GO_MEMLIMIT="$((MEM_MIB * 75 / 100))MiB"
+        warn "检测到本机可用内存只有约 ${MEM_MIB} MiB（≤256 MiB），已启用低内存模式："
+        warn "   sing-box 服务将设置 GOMEMLIMIT=${GO_MEMLIMIT} GOGC=70，减少被系统 OOM 杀掉的概率"
+        warn "   建议下面只选 1~2 个协议（例如只选 VLESS Reality，或 Reality + SS）"
+    elif [ "$MEM_MIB" -gt 0 ]; then
+        info "内存: 约 ${MEM_MIB} MiB"
+    fi
+}
+
+detect_mem
+
+# -----------------------
 # 安装依赖
 install_deps() {
     info "安装系统依赖..."
@@ -793,6 +822,12 @@ start_pre() {
 }
 OPENRC
         
+        if [ "${LOW_MEM:-false}" = "true" ]; then
+            # 低内存模式：通过 supervise-daemon --env 传给 sing-box，同时 export 兼容其他启动方式
+            sed -i "s|^supervise_daemon_args=\"\(.*\)\"|supervise_daemon_args=\"\1 --env GOMEMLIMIT=${GO_MEMLIMIT} --env GOGC=70\"|" "$SERVICE_PATH"
+            sed -i "s|^name=\"sing-box\"|export GOMEMLIMIT=${GO_MEMLIMIT}\nexport GOGC=70\nname=\"sing-box\"|" "$SERVICE_PATH"
+            info "低内存模式: 已在 $SERVICE_PATH 设置 GOMEMLIMIT=${GO_MEMLIMIT} GOGC=70"
+        fi
         chmod +x "$SERVICE_PATH"
         rc-update add sing-box default >/dev/null 2>&1 || warn "添加开机自启失败"
         rc-service sing-box restart || {
@@ -832,6 +867,10 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 SYSTEMD
+        if [ "${LOW_MEM:-false}" = "true" ]; then
+            sed -i "s|^LimitNOFILE=1048576|LimitNOFILE=1048576\nEnvironment=GOMEMLIMIT=${GO_MEMLIMIT}\nEnvironment=GOGC=70|" "$SERVICE_PATH"
+            info "低内存模式: 已在 $SERVICE_PATH 设置 GOMEMLIMIT=${GO_MEMLIMIT} GOGC=70"
+        fi
         
         systemctl daemon-reload
         systemctl enable sing-box >/dev/null 2>&1
