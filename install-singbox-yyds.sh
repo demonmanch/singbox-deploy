@@ -46,6 +46,50 @@ check_root() {
 check_root
 
 # -----------------------
+# 检测虚拟化类型和内核版本
+# 新版 sing-box 由 Go 1.24+ 编译，而 Go 1.24 起要求 Linux 内核 >= 3.2（见 Go 1.24 发行说明）
+detect_virt() {
+    VIRT="unknown"
+    if command -v systemd-detect-virt >/dev/null 2>&1; then
+        VIRT=$(systemd-detect-virt 2>/dev/null || true)
+        [ -z "$VIRT" ] && VIRT="none"
+    fi
+    if [ "$VIRT" = "unknown" ] || [ "$VIRT" = "none" ]; then
+        if [ -f /proc/user_beancounters ] || [ -d /proc/vz ] && [ ! -d /proc/bc ]; then
+            VIRT="openvz"
+        elif grep -qa 'container=lxc' /proc/1/environ 2>/dev/null || grep -qE '/lxc/|lxc\.payload' /proc/1/cgroup 2>/dev/null; then
+            VIRT="lxc"
+        elif [ -f /.dockerenv ] || grep -q docker /proc/1/cgroup 2>/dev/null; then
+            VIRT="docker"
+        fi
+    fi
+    case "$VIRT" in
+        openvz|lxc|lxc-libvirt|docker|podman|systemd-nspawn|container-other|wsl) IS_CONTAINER=true ;;
+        *) IS_CONTAINER=false ;;
+    esac
+}
+
+check_kernel() {
+    local kver major minor
+    kver=$(uname -r 2>/dev/null || echo "0.0")
+    major=$(printf '%s' "$kver" | cut -d. -f1 | tr -cd '0-9')
+    minor=$(printf '%s' "$kver" | cut -d. -f2 | tr -cd '0-9')
+    major=${major:-0}; minor=${minor:-0}
+    info "虚拟化类型: ${VIRT}，内核版本: ${kver}"
+    if [ "$major" -lt 3 ] || { [ "$major" -eq 3 ] && [ "$minor" -lt 2 ]; }; then
+        err "内核版本 ${kver} 太旧（低于 3.2），新版 sing-box（Go 1.24+ 编译）无法在此内核上运行。"
+        err "这通常是老旧的 OpenVZ 6 小鸡（内核 2.6.x）。请更换为 KVM 或新版 LXC/OpenVZ 7 机器，或联系商家升级内核。"
+        exit 1
+    fi
+    if [ "$IS_CONTAINER" = "true" ]; then
+        info "检测到容器环境(${VIRT})：容器内无法修改内核参数(如 BBR/sysctl/TUN)，本脚本不会改动这些，可正常安装。"
+    fi
+}
+
+detect_virt
+check_kernel
+
+# -----------------------
 # 安装依赖
 install_deps() {
     info "安装系统依赖..."
