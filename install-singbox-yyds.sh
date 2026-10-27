@@ -616,7 +616,68 @@ install_singbox() {
     info "sing-box 安装成功: $INSTALLED_VERSION"
 }
 
+# -----------------------
+# 纯 IPv6 机器：GitHub 等不支持 IPv6，sing-box 官方安装脚本会下载失败
+# 提示使用公共 NAT64/DNS64（nat64.net 提供），可选临时切换 /etc/resolv.conf，安装后自动恢复
+RESOLV_BAK=""
+RESOLV_MODE=""
+restore_resolv() {
+    [ -n "$RESOLV_BAK" ] || return 0
+    case "$RESOLV_MODE" in
+        mv)   rm -f /etc/resolv.conf; mv -f "$RESOLV_BAK" /etc/resolv.conf ;;
+        cp)   cat "$RESOLV_BAK" > /etc/resolv.conf; rm -f "$RESOLV_BAK" ;;
+        none) rm -f /etc/resolv.conf ;;
+    esac
+    RESOLV_BAK=""
+    info "已恢复原来的 /etc/resolv.conf"
+}
+
+check_ipv6_only_download() {
+    local has4 has6 ans
+    command -v ip >/dev/null 2>&1 || return 0
+    has4=$(ip -4 route show default 2>/dev/null | head -n1 || true)
+    has6=$(ip -6 route show default 2>/dev/null | head -n1 || true)
+    if [ -n "$has4" ] || [ -z "$has6" ]; then
+        return 0
+    fi
+    info "检测到本机只有 IPv6（没有 IPv4 默认路由）"
+    if [ "$OS" = "alpine" ]; then
+        info "Alpine 会从 Alpine 官方仓库安装 sing-box（dl-cdn.alpinelinux.org 支持 IPv6），一般不需要额外设置"
+        return 0
+    fi
+    if curl -s --max-time 8 -o /dev/null https://github.com && curl -s --max-time 8 -o /dev/null https://sing-box.app/install.sh; then
+        info "GitHub 可以访问，继续安装"
+        return 0
+    fi
+    warn "=================== ⚠️ 纯 IPv6 机器无法访问 GitHub ==================="
+    warn "sing-box 官方安装脚本要从 GitHub 下载，而 GitHub 不支持 IPv6，直接安装会失败。"
+    echo "   解决办法：临时把 DNS 换成公共 NAT64/DNS64 服务器（nat64.net 免费提供），"
+    echo "   它会让纯 IPv6 机器也能访问只有 IPv4 的网站。服务器地址: 2a00:1098:2b::1 、2a01:4f8:c2c:123f::1"
+    echo "   手动做法: cp /etc/resolv.conf /etc/resolv.conf.bak && echo 'nameserver 2a00:1098:2b::1' > /etc/resolv.conf"
+    echo "             装完后再改回: mv /etc/resolv.conf.bak /etc/resolv.conf"
+    warn "======================================================================"
+    read -r -p "是否让脚本临时切换 DNS 到 NAT64，安装完成后自动恢复原 DNS?(y/N): " ans || ans=""
+    if [[ ! "$ans" =~ ^[Yy]$ ]]; then
+        warn "未切换 DNS，继续尝试安装（可能失败）"
+        return 0
+    fi
+    RESOLV_BAK="/etc/resolv.conf.sb-nat64-bak"
+    if [ ! -e /etc/resolv.conf ] && [ ! -L /etc/resolv.conf ]; then
+        RESOLV_MODE="none"
+    elif mv /etc/resolv.conf "$RESOLV_BAK" 2>/dev/null; then
+        RESOLV_MODE="mv"
+    else
+        cp /etc/resolv.conf "$RESOLV_BAK"; RESOLV_MODE="cp"
+    fi
+    trap restore_resolv EXIT
+    printf 'nameserver 2a00:1098:2b::1\nnameserver 2a01:4f8:c2c:123f::1\n' > /etc/resolv.conf
+    info "已临时切换 DNS 到 NAT64（原文件备份为 $RESOLV_BAK，安装完成或脚本退出时自动恢复）"
+}
+
+check_ipv6_only_download
 install_singbox
+restore_resolv
+trap - EXIT
 
 # -----------------------
 # 生成 Reality 密钥对（必须在 sing-box 安装之后）
@@ -1792,7 +1853,15 @@ action_update() {
     if [ "$OS" = "alpine" ]; then
         apk update && apk upgrade sing-box || bash <(curl -fsSL https://sing-box.app/install.sh)
     else
-        bash <(curl -fsSL https://sing-box.app/install.sh)
+        bash <(curl -fsSL https://sing-box.app/install.sh) || {
+            err "下载 sing-box 失败"
+            if [ -z "$(ip -4 route show default 2>/dev/null || true)" ]; then
+                warn "本机可能是纯 IPv6，GitHub 不支持 IPv6。可临时改用 NAT64 DNS 再更新："
+                echo "   cp /etc/resolv.conf /etc/resolv.conf.bak && echo 'nameserver 2a00:1098:2b::1' > /etc/resolv.conf"
+                echo "   更新完成后恢复: mv /etc/resolv.conf.bak /etc/resolv.conf"
+            fi
+            return 1
+        }
     fi
     
     info "更新完成,已重启服务..."
@@ -3133,7 +3202,7 @@ while true; do
                 stop) service_stop && info "已停止" ;;
                 restart) service_restart && info "已重启" ;;
                 status) service_status ;;
-                update) action_update ;;
+                update) action_update || true ;;
                 relay) action_generate_relay || true ;;
                 uninstall) action_uninstall; exit 0 ;;
                 *) warn "无效选项: $opt" ;;
