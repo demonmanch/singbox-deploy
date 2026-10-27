@@ -448,13 +448,82 @@ while true; do
     CUSTOM_IP="$(echo "$CUSTOM_IP" | tr -d '[:space:]')"
 done
 
+# -----------------------
+# Reality 目标网站(SNI)检查：只警告，不阻止
+# 从本机对 SNI:443 做 TLS1.3 + h2 握手（Reality 要求目标支持 TLS1.3，h2 更像正常浏览器流量）
+reality_target_check() {
+    local sni="$1" out
+    if ! command -v openssl >/dev/null 2>&1; then
+        warn "未找到 openssl，跳过 Reality 目标网站握手检查"
+        return 0
+    fi
+    if command -v timeout >/dev/null 2>&1; then
+        out=$(timeout 10 openssl s_client -connect "${sni}:443" -servername "$sni" -tls1_3 -alpn h2 </dev/null 2>&1 || true)
+    else
+        out=$(openssl s_client -connect "${sni}:443" -servername "$sni" -tls1_3 -alpn h2 </dev/null 2>&1 || true)
+    fi
+    if printf '%s\n' "$out" | grep -q 'TLSv1\.3' && printf '%s\n' "$out" | grep -q 'ALPN protocol: h2'; then
+        info "✅ Reality 目标 ${sni}:443 握手正常（TLS1.3 + h2）"
+        return 0
+    fi
+    warn "⚠️ 从本机对 ${sni}:443 的 TLS1.3 + h2 握手失败：该网站可能不支持 TLS1.3/h2，或本机连不上它。"
+    warn "   Reality 节点可能无法使用，建议换一个 SNI。"
+    return 1
+}
+
+# SNI 风险提示 + 握手检查 + 目标与本机所在地/运营商对比（尽力而为，查询失败不影响安装）
+review_reality_sni() {
+    local sni lsni bad=0 tip loc_cc loc_org tgt_ip tgt_cc tgt_org
+    sni="$1"
+    lsni=$(printf '%s' "$sni" | tr '[:upper:]' '[:lower:]')
+    case "$lsni" in
+        *apple*|*icloud*|*microsoft*|*.cn|*.ru|*.ir)
+            warn "⚠️ SNI「${sni}」不推荐：apple/icloud/microsoft 相关域名或 .cn/.ru/.ir 结尾的网站作为 Reality 目标，"
+            warn "   更容易导致服务器 IP 被墙（Xray-core 新版本如 v26.9.30 对这类目标也会输出同样的警告）。"
+            bad=1
+            ;;
+    esac
+    reality_target_check "$sni" || bad=1
+    tgt_ip=$(curl -s -o /dev/null --max-time 6 -w '%{remote_ip}' "https://${sni}" 2>/dev/null || true)
+    if [ -n "$tgt_ip" ]; then
+        tgt_cc=$(curl -s --max-time 5 "https://ipinfo.io/${tgt_ip}/country" 2>/dev/null | tr -d '[:space:]' || true)
+        tgt_org=$(curl -s --max-time 5 "https://ipinfo.io/${tgt_ip}/org" 2>/dev/null | head -n1 | tr -d '\r' || true)
+        loc_cc=$(curl -s --max-time 5 "https://ipinfo.io/country" 2>/dev/null | tr -d '[:space:]' || true)
+        loc_org=$(curl -s --max-time 5 "https://ipinfo.io/org" 2>/dev/null | head -n1 | tr -d '\r' || true)
+        [[ "$tgt_cc" =~ ^[A-Z]{2}$ ]] || tgt_cc=""
+        [[ "$loc_cc" =~ ^[A-Z]{2}$ ]] || loc_cc=""
+        case "$tgt_org" in *"{"*|*"<"*) tgt_org="" ;; esac
+        case "$loc_org" in *"{"*|*"<"*) loc_org="" ;; esac
+        info "Reality 目标 ${sni} → ${tgt_ip} ${tgt_cc:+[$tgt_cc]} ${tgt_org}"
+        [ -n "$loc_cc$loc_org" ] && info "本机出口 → ${loc_cc:+[$loc_cc]} ${loc_org}"
+        if [ -n "$tgt_org" ] && [ -n "$loc_org" ] && [ "${tgt_org%% *}" = "${loc_org%% *}" ]; then
+            info "目标网站和本机在同一个运营商(ASN)，很理想"
+        elif [ -n "$tgt_cc" ] && [ -n "$loc_cc" ] && [ "$tgt_cc" != "$loc_cc" ]; then
+            warn "目标网站服务器在 ${tgt_cc}，本机在 ${loc_cc}，相距可能较远（延迟高时更容易被识别）"
+            bad=1
+        fi
+    fi
+    tip="建议：Reality 的 SNI 最好选离本机近（同机房/同国家）、支持 TLS1.3 + h2 的网站；"
+    tip="${tip}可在自己电脑上用 RealiTLScanner 扫描本机 IP 附近的网站（用法见 README）。"
+    info "$tip"
+    return "$bad"
+}
+
 # 如果用户选择了 Reality 协议，询问 server_name(SNI)
 REALITY_SNI=""
 if $ENABLE_REALITY || $ENABLE_ANYTLS; then
-    echo ""
-    echo "请输入 Reality 的 SNI(留空默认 addons.mozilla.org):"
-    read -r REALITY_SNI
-    REALITY_SNI="$(echo "${REALITY_SNI:-addons.mozilla.org}" | tr -d '[:space:]')"
+    while true; do
+        echo ""
+        echo "请输入 Reality 的 SNI(留空默认 addons.mozilla.org):"
+        read -r REALITY_SNI || REALITY_SNI=""
+        REALITY_SNI="$(echo "${REALITY_SNI:-addons.mozilla.org}" | tr -d '[:space:]')"
+        info "正在检查 Reality 目标网站 ${REALITY_SNI} ..."
+        if review_reality_sni "$REALITY_SNI"; then
+            break
+        fi
+        read -r -p "是否重新输入 SNI?(y/N，回车继续使用 ${REALITY_SNI}): " RESNI || RESNI=""
+        [[ "$RESNI" =~ ^[Yy]$ ]] || break
+    done
 else
     # 也设默认，方便后续统一处理（若未选 reality，也写入缓存以便 sb 读取）
     REALITY_SNI="addons.mozilla.org"
