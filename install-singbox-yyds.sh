@@ -1421,6 +1421,12 @@ action_uninstall() {
 action_generate_relay() {
     read_config || return 1
 
+    # 缓存说已启用 SS，但 config.json 里其实没有 SS 入站（节点被删过）：按未启用处理，提示重新部署
+    if [ "${ENABLE_SS:-false}" = "true" ] && [ -z "$(ss_from_config listen_port)" ]; then
+        warn "缓存标记已启用 SS，但 $CONFIG_PATH 中没有 SS 入站(缓存已过期)"
+        ENABLE_SS=false
+    fi
+
     # 若本机 config.json 已有 SS 入站（缓存标记缺失/过期），直接使用，避免重复添加 ss-in
     if [ "${ENABLE_SS:-false}" != "true" ] && [ -n "$(ss_from_config listen_port)" ]; then
         info "检测到 config.json 中已有 SS 入站，直接使用"
@@ -1440,8 +1446,13 @@ action_generate_relay() {
             while true; do
                 read -r -p "请输入 SS 端口(NAT 机器请填商家映射的端口，留空则随机 10000-60000): " USER_SS_PORT
                 SS_PORT="${USER_SS_PORT:-$(rand_port)}"
-                validate_port "$SS_PORT" && break
-                err "端口无效: $SS_PORT (需为 1-65535 的数字)"
+                if ! validate_port "$SS_PORT"; then
+                    err "端口无效: $SS_PORT (需为 1-65535 的数字)"
+                elif jq -e --argjson p "$SS_PORT" 'any((.inbounds // [])[]; .listen_port == $p)' "$CONFIG_PATH" >/dev/null 2>&1; then
+                    err "端口 $SS_PORT 已被本机其他节点使用，请换一个"
+                else
+                    break
+                fi
             done
             SS_PSK=$(rand_pass)
             SS_METHOD="aes-128-gcm"
@@ -1619,9 +1630,12 @@ action_generate_relay() {
     done
 
     # 记住确认过的入口地址，下次作为默认值
-    if [ "${CUSTOM_IP:-}" != "$INBOUND_IP" ]; then
-        cache_set CUSTOM_IP "$INBOUND_IP"
-        info "已将入口地址 $INBOUND_IP 保存为 CUSTOM_IP（下次默认使用，节点链接也会用它）"
+    # IPv6 保存时带方括号，以便「查看协议链接」生成的 URI 正确（线路机配置里用的是不带括号的值）
+    local SAVE_IP="$INBOUND_IP"
+    [[ "$SAVE_IP" == *:* ]] && SAVE_IP="[$SAVE_IP]"
+    if [ "${CUSTOM_IP:-}" != "$SAVE_IP" ]; then
+        cache_set CUSTOM_IP "$SAVE_IP"
+        info "已将入口地址 $SAVE_IP 保存为 CUSTOM_IP（下次默认使用，节点链接也会用它）"
     fi
 
     PUBLIC_IP="$INBOUND_IP"
@@ -1664,13 +1678,13 @@ valid_port() { [[ "$1" =~ ^[0-9]{1,5}$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 
 
 # 端口是否已被占用（检测不到工具时视为未占用）
 port_in_use() {
+    local addrs=""
     if command -v ss >/dev/null 2>&1; then
-        ss -lntuH 2>/dev/null | awk '{print $5}' | grep -qE "[:.]$1\$"
+        addrs=$(ss -lntu 2>/dev/null | awk 'NR>1{print $5}' || true)
     elif command -v netstat >/dev/null 2>&1; then
-        netstat -lntu 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1\$"
-    else
-        return 1
+        addrs=$(netstat -lntu 2>/dev/null | awk '{print $4}' || true)
     fi
+    printf '%s\n' "$addrs" | grep -qE "[:.]$1\$"
 }
 
 # 端口是否属于本机现有 sing-box 配置（重新安装/改配置时允许沿用自己的端口）
@@ -1942,7 +1956,15 @@ fi
 ask_port "请输入线路机(中转节点)监听端口(留空随机 20000-65000): " ""
 LISTEN_PORT="$ASKED_PORT"
 
-PUB_IP=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null | tr -d '[:space:]' || true)
+PUB_IP=""
+for ip_url in https://api.ipify.org https://api64.ipify.org https://icanhazip.com; do
+    PUB_IP=$(curl -s --max-time 5 "$ip_url" 2>/dev/null | tr -d '[:space:]' || true)
+    # 只接受像 IP 的结果（防止把错误页面写进链接）
+    if [[ "$PUB_IP" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || [[ "$PUB_IP" =~ ^[0-9A-Fa-f:]+$ && "$PUB_IP" == *:*:* ]]; then
+        break
+    fi
+    PUB_IP=""
+done
 [ -z "$PUB_IP" ] && PUB_IP="YOUR_RELAY_IP"
 set_pub_ip_uri
 
@@ -2246,7 +2268,7 @@ while true; do
                 restart) service_restart && info "已重启" ;;
                 status) service_status ;;
                 update) action_update ;;
-                relay) action_generate_relay ;;
+                relay) action_generate_relay || true ;;
                 uninstall) action_uninstall; exit 0 ;;
                 *) warn "无效选项: $opt" ;;
             esac
