@@ -28,6 +28,22 @@
 >   - 方法二：输出最后一行的 `echo '<base64>' | base64 -d > /root/relay-install.sh && bash /root/relay-install.sh`，整行复制到线路机执行即可
 >   - 运行时端口/名称直接回车用默认值；把得到的 vless:// 链接导入 Shadowrocket，无需设置「代理通过」；记得在线路机云厂商安全组（如 Oracle）放行监听端口
 >   - 如需查看完整脚本，生成时在「是否显示完整脚本内容?(y/N)」处输入 y
+>
+> ### 📱 HY2 链接适配 v2rayNG（证书指纹 pinSHA256）
+>
+> v2rayNG 使用的 Xray 内核（26.2.6+）已移除 `allowInsecure`，旧的 `hy2://...&insecure=1` 链接在 v2rayNG 上会报错、无法连接。现在 HY2 链接会自动带上自签证书的 SHA-256 指纹：
+>
+> - **通用链接**（v2rayNG / Shadowrocket 都能用）：`hy2://密码@IP:端口/?sni=www.bing.com&alpn=h3&insecure=1&pinSHA256=<64位指纹>#hy2...`
+> - **Shadowrocket 备用**（旧格式，名称带 `-SR-legacy`，v2rayNG 不可用）：电脑上已经导入的旧节点可以继续用，不必重新导入。
+> - TUIC 链接不变（v2rayNG/Xray 不支持 TUIC）；线路机中转节点是 VLESS Reality，不受影响。
+>
+> **已安装的落地机只需更新 `sb` 面板（不重装、不改节点/端口/密码/证书）**，以 root 整行执行：
+>
+> ```bash
+> curl -fsSL https://raw.githubusercontent.com/demonmanch/singbox-deploy/main/install-singbox-yyds.sh -o /tmp/sb-install.sh && awk '/<<.SB_SCRIPT.$/{f=1;next} /^SB_SCRIPT$/{f=0} f' /tmp/sb-install.sh > /tmp/sb.new && grep -q pinSHA256 /tmp/sb.new && bash -n /tmp/sb.new && cp /tmp/sb.new /usr/local/bin/sb && chmod +x /usr/local/bin/sb && ln -sf /usr/local/bin/sb /usr/bin/sb && rm -f /tmp/sb-install.sh /tmp/sb.new && echo "sb 面板已更新"
+> ```
+>
+> 然后输入 `sb`，选 `1) 查看协议链接`，复制「通用链接」那一行。手机 v2rayNG：先长按删除旧的 hy2 节点，再复制新链接 → 右上角 `+` →「从剪贴板导入」，连接即可。
 
 
 一个强大的 Sing-box 自动化部署工具，支持SS/HY2/TUIC/VLESS Reality/AnyTLS Reality 协议自选部署和线路机 VLESS Reality 中转的完整解决方案。

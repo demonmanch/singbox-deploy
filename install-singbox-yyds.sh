@@ -844,6 +844,18 @@ else
 fi
 
 # -----------------------
+# HY2 自签证书 SHA-256 指纹(64 位小写十六进制, 无冒号)
+# v2rayNG/Xray 26.2.6+ 已移除 allowInsecure(insecure=1), 必须用证书指纹 pinSHA256 才能连接自签证书节点
+cert_sha256_hex() {
+    local cert="${1:-/etc/sing-box/certs/fullchain.pem}" fp
+    [ -f "$cert" ] || return 1
+    command -v openssl >/dev/null 2>&1 || return 1
+    fp=$(openssl x509 -noout -fingerprint -sha256 -in "$cert" 2>/dev/null | sed 's/^[^=]*=//' | tr -d ':[:space:]' | tr 'A-F' 'a-f')
+    [[ "$fp" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s' "$fp"
+}
+
+# -----------------------
 # 生成链接(仅生成已选择的协议)
 generate_uris() {
     local host="$PUB_IP"
@@ -861,8 +873,18 @@ generate_uris() {
     
     if $ENABLE_HY2; then
         hy2_encoded=$(printf "%s" "$PSK_HY2" | sed 's/:/%3A/g; s/+/%2B/g; s/\//%2F/g; s/=/%3D/g')
-        echo "=== Hysteria2 (HY2) ==="
-        echo "hy2://${hy2_encoded}@${host}:${PORT_HY2}/?sni=www.bing.com&alpn=h3&insecure=1#hy2${suffix}"
+        local hy2_pin
+        hy2_pin=$(cert_sha256_hex /etc/sing-box/certs/fullchain.pem || true)
+        if [ -n "$hy2_pin" ]; then
+            echo "=== Hysteria2 (HY2) 通用链接: v2rayNG/Xray + Shadowrocket(带证书指纹) ==="
+            echo "hy2://${hy2_encoded}@${host}:${PORT_HY2}/?sni=www.bing.com&alpn=h3&insecure=1&pinSHA256=${hy2_pin}#hy2${suffix}"
+            echo "=== Hysteria2 (HY2) Shadowrocket 备用(旧格式, 无指纹, v2rayNG 不可用) ==="
+            echo "hy2://${hy2_encoded}@${host}:${PORT_HY2}/?sni=www.bing.com&alpn=h3&insecure=1#hy2${suffix}-SR-legacy"
+        else
+            echo "=== Hysteria2 (HY2) ==="
+            echo "[WARN] 无法读取证书指纹(/etc/sing-box/certs/fullchain.pem 或 openssl 缺失), 以下链接 v2rayNG 不可用"
+            echo "hy2://${hy2_encoded}@${host}:${PORT_HY2}/?sni=www.bing.com&alpn=h3&insecure=1#hy2${suffix}"
+        fi
         echo ""
     fi
 
@@ -994,6 +1016,37 @@ rand_uuid() { cat /proc/sys/kernel/random/uuid 2>/dev/null || openssl rand -hex 
 # URL 编码
 url_encode() {
     printf "%s" "$1" | sed -e 's/%/%25/g' -e 's/:/%3A/g' -e 's/+/%2B/g' -e 's/\//%2F/g' -e 's/=/%3D/g'
+}
+
+# 确保有 openssl（计算证书指纹用；缺失时按系统自动安装，失败不退出）
+ensure_openssl() {
+    command -v openssl >/dev/null 2>&1 && return 0
+    warn "未找到 openssl，尝试自动安装..." >&2
+    case "$OS" in
+        alpine) apk add --no-cache openssl >/dev/null 2>&1 || true ;;
+        debian) { DEBIAN_FRONTEND=noninteractive apt-get install -y openssl >/dev/null 2>&1 \
+                  || { apt-get update -y >/dev/null 2>&1 && DEBIAN_FRONTEND=noninteractive apt-get install -y openssl >/dev/null 2>&1; }; } || true ;;
+        redhat) yum install -y openssl >/dev/null 2>&1 || true ;;
+    esac
+    command -v openssl >/dev/null 2>&1
+}
+
+# 证书 SHA-256 指纹(64 位小写十六进制, 无冒号)；失败返回 1
+# v2rayNG/Xray 26.2.6+ 已移除 allowInsecure(insecure=1)，自签证书节点必须带 pinSHA256 指纹
+cert_sha256_hex() {
+    local cert="$1" fp
+    [ -n "$cert" ] && [ -f "$cert" ] || return 1
+    ensure_openssl || return 1
+    fp=$(openssl x509 -noout -fingerprint -sha256 -in "$cert" 2>/dev/null | sed 's/^[^=]*=//' | tr -d ':[:space:]' | tr 'A-F' 'a-f')
+    [[ "$fp" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s' "$fp"
+}
+
+# 从现有 config.json 读取 HY2 入站使用的证书路径（读不到时用默认路径）
+hy2_cert_path() {
+    local p=""
+    [ -f "$CONFIG_PATH" ] && p=$(jq -r 'first((.inbounds // [])[] | select(.type=="hysteria2") | .tls.certificate_path // empty) // empty' "$CONFIG_PATH" 2>/dev/null || true)
+    printf '%s' "${p:-/etc/sing-box/certs/fullchain.pem}"
 }
 
 # 读取配置
@@ -1180,9 +1233,25 @@ generate_uris() {
     
     if [ "${ENABLE_HY2:-false}" = "true" ]; then
         hy2_encoded=$(url_encode "$HY2_PSK")
-        echo "=== Hysteria2 (HY2) ===" >> "$URI_FILE"
-        echo "hy2://${hy2_encoded}@${PUBLIC_IP}:${HY2_PORT}/?sni=www.bing.com&alpn=h3&insecure=1#hy2${node_suffix}" >> "$URI_FILE"
-        echo "" >> "$URI_FILE"
+        local hy2_cert hy2_pin
+        hy2_cert=$(hy2_cert_path)
+        hy2_pin=$(cert_sha256_hex "$hy2_cert" || true)
+        if [ -z "$hy2_pin" ]; then
+            warn "无法读取 HY2 证书指纹($hy2_cert)，生成的 HY2 链接 v2rayNG 不可用"
+        fi
+        {
+            if [ -n "$hy2_pin" ]; then
+                echo "=== Hysteria2 (HY2) 通用链接: v2rayNG/Xray + Shadowrocket(带证书指纹) ==="
+                echo "hy2://${hy2_encoded}@${PUBLIC_IP}:${HY2_PORT}/?sni=www.bing.com&alpn=h3&insecure=1&pinSHA256=${hy2_pin}#hy2${node_suffix}"
+                echo "=== Hysteria2 (HY2) Shadowrocket 备用(旧格式, 无指纹, v2rayNG 不可用) ==="
+                echo "hy2://${hy2_encoded}@${PUBLIC_IP}:${HY2_PORT}/?sni=www.bing.com&alpn=h3&insecure=1#hy2${node_suffix}-SR-legacy"
+            else
+                echo "=== Hysteria2 (HY2) ==="
+                echo "[WARN] 无法读取证书指纹($hy2_cert)，以下链接 v2rayNG 不可用"
+                echo "hy2://${hy2_encoded}@${PUBLIC_IP}:${HY2_PORT}/?sni=www.bing.com&alpn=h3&insecure=1#hy2${node_suffix}"
+            fi
+            echo ""
+        } >> "$URI_FILE"
     fi
     
     if [ "${ENABLE_TUIC:-false}" = "true" ]; then
