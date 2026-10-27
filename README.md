@@ -29,6 +29,24 @@
 >   - 运行时端口/名称直接回车用默认值；把得到的 vless:// 链接导入 Shadowrocket，无需设置「代理通过」；记得在线路机云厂商安全组（如 Oracle）放行监听端口
 >   - 如需查看完整脚本，生成时在「是否显示完整脚本内容?(y/N)」处输入 y
 >
+> ### 🛠️ 安装脚本的安全检查与 NAT 适配
+>
+> - **连接 IP 自动检测更稳**：先查 IPv4，再查 IPv6（多个接口，每个 5 秒超时）；链接里的 IPv6 自动加方括号。
+> - **NAT / WARP 识别**：如果出口是 Cloudflare WARP（`cdn-cgi/trace` 显示 `warp=on/plus`，或 IP 属于 AS13335），或者本机网卡是内网 IP（10.x / 172.16-31.x / 192.168.x / 100.64-127.x）且和公网出口 IP 不同，脚本**不会自动填链接 IP**，会要求你输入商家面板里的入口 IP/域名（也就是 SSH 登录用的地址）。Oracle/AWS 等云厂商网卡本来就是内网 IP，确认后把公网 IP 输入进去即可。已保存的 `CUSTOM_IP` 优先，老安装不受影响。
+> - **NAT 端口范围模式**：安装时可输入商家给的端口范围（如 `56566-56586` 或 `20001,20002`），随机端口只在其中挑。端口冲突按 TCP/UDP 分开检测：Reality/AnyTLS（TCP）和 HY2/TUIC（UDP）可以共用同一个端口号，SS 同时占 TCP+UDP。选了 HY2/TUIC 会提醒：**NAT 机器必须确认商家映射了该端口的 UDP**。
+> - **纯 IPv6 机器**：GitHub 不支持 IPv6，sing-box 官方安装脚本会下载失败。脚本会提示使用公共 NAT64 DNS（nat64.net 的 `2a00:1098:2b::1`），并询问是否临时切换 `/etc/resolv.conf`（默认否；切换前自动备份，安装完自动恢复）。Alpine 直接从 Alpine 官方仓库安装，不受影响。
+> - **低内存小鸡**（≤256 MiB）：服务自动加上 `GOMEMLIMIT`（约内存的 75%）和 `GOGC=70`，并建议只开 1~2 个协议。
+> - **虚拟化/内核检测**：内核低于 3.2（老 OpenVZ 6）时直接停止并说明原因（新版 sing-box 由 Go 1.24+ 编译，需要内核 ≥ 3.2）；容器环境会提示（本脚本本来就不改 BBR/sysctl/TUN）。
+> - **HY2**：新安装的 HY2 入站默认带 `"ignore_client_bandwidth": true`（sing-box 1.11+，让客户端用 BBR，不按客户端填写的带宽跑 Brutal）。已安装的节点不变，重装才生效。
+> - **安装后自检**：`sing-box check` 不通过会还原旧配置并停止；安装后列出每个端口的 TCP/UDP 监听情况、服务状态（失败时显示最近 20 行日志）、Reality 目标的 TLS1.3+h2 握手结果。外网测 TCP 端口可用 [itdog tcping](https://www.itdog.cn/tcping/) 或 [ping.pe](https://ping.pe/)；UDP（HY2/TUIC）没法用 tcping 测，请直接用客户端连。
+> - **Reality 目标(SNI)检查**：SNI 含 apple / icloud / microsoft 或以 .cn / .ru / .ir 结尾时会警告（更容易导致 IP 被墙，Xray-core 源码里也有同样的警告）；会从本机做 TLS1.3+h2 握手检查，并对比目标网站和本机的国家/运营商(ASN)。只警告不阻止，可选择重新输入。默认仍是 `addons.mozilla.org`。
+>
+> **用 RealiTLScanner 找离 VPS 近的 SNI**（在**自己电脑**上运行，不要在 VPS 上扫，以免 VPS 被标记）：
+>
+> 1. 到 <https://github.com/XTLS/RealiTLScanner/releases> 下载对应系统的文件（Windows 选 `RealiTLScanner-windows-64.exe`）。
+> 2. 扫描 VPS 附近的 IP 段（把 `1.2.3.4` 换成你的 VPS IP）：`./RealiTLScanner -addr 1.2.3.0/24 -thread 10 -timeout 5 -out out.csv`
+> 3. 打开 `out.csv`，挑一个支持 TLS1.3 + h2、看起来正常的网站域名（避开 apple/microsoft/.cn 等），安装时填进 SNI。
+>
 > ### 🔀 一台线路机中转多台落地机
 >
 > 同一台线路机可以同时中转多台落地机，每台落地机一个独立节点（独立端口和 UUID，复用同一套 Reality 密钥），互不影响：
