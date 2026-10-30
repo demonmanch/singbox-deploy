@@ -17,11 +17,11 @@
 > - **地址校验**：落地机地址只接受 IPv4 / IPv6 / 域名，拒绝纯数字（如误填端口 `12345`）并重新输入；生成前显示汇总（地址、端口、加密方式、打码的密码）并 y/N 确认，可改填其他 IP。
 > - **NAT 端口**：NAT 机器上 SS 端口必须是商家映射给你的端口之一，提示和汇总里都会提醒。
 > - **线路机脚本**：覆盖线路机已有 `/etc/sing-box/config.json` 前自动备份为 `config.json.bak.时间戳` 并给出警告；配置改用 jq 生成，密码含特殊字符也不会出错；补充 SS 入站时加密方式与变量一致（默认仍为 aes-128-gcm），并校验配置、失败自动还原。
-> - **节点名称/备注**：线路机安装时可设置 vless 链接 `#` 后的节点名称（默认 `中转-线路机IP`，支持中文/空格，自动 URL 编码）。之后可随时修改，只重新生成链接和 `/etc/sing-box/relay_uri.txt`，不动运行中的配置：
->   - `bash /root/relay-install.sh rename`（或 `bash /etc/sing-box/relay-install.sh rename`）
->   - `bash /root/relay-install.sh show` 查看链接
->   - 已安装过时直接运行脚本会出现菜单：1. 追加这台落地机为新的中转节点（回车默认） 2. 查看所有节点链接 3. 修改节点名称 4. 删除某个中转节点 5. 添加/删除直连节点 9. ⚠️ 全部重新安装 0. 退出
-> - **可选：线路机直连节点**：线路机安装时会问「是否同时添加一个本机(线路机)直连出口的 VLESS Reality 节点? (y/N)」，默认 N（与以前完全一样）。选 y 后再输入直连端口（回车随机，不能与中转端口相同，已占用的端口会提示换一个）和名称（默认 `直连-<线路机IP>`），会多出一个 `vless-direct-in` 入站（独立 UUID，复用同一套 Reality 密钥/SNI/short_id）走线路机本机出口；中转入站仍走落地机。两条链接都写入 `/etc/sing-box/relay_uri.txt`，并分别标注「中转节点(出口落地机)」「直连节点(出口本机)」。之后可用 `bash /root/relay-install.sh direct`（或菜单 4）添加/删除直连节点，`rename` 可选择改哪个节点的名称。**记得在云安全组放行两个端口。**
+> - **节点名称/备注**：线路机安装时可设置 vless 链接 `#` 后的节点名称（默认 `中转-线路机IP`，支持中文/空格，自动 URL 编码）。之后可随时修改，只重新生成链接和 `/etc/sing-box-relay/relay_uri.txt`，不动运行中的配置：
+>   - 线路机上输入 `sb` 进入菜单，或 `bash /etc/sing-box-relay/relay-install.sh rename`（旧命令 `bash /etc/sing-box/relay-install.sh rename` 仍可用）
+>   - `bash /etc/sing-box-relay/relay-install.sh show` 查看链接
+>   - 已安装过时直接运行脚本会出现菜单：1. 追加这台落地机为新的中转节点（回车默认） 2. 查看所有节点链接 3. 修改节点名称 4. 删除某个中转节点 5. 添加/删除直连节点 6. 重启/查看线路机服务 7. 安装/管理本机的落地机节点 8. 卸载线路机节点 9. ⚠️ 全部重新安装 0. 退出
+> - **可选：线路机直连节点**：线路机安装时会问「是否同时添加一个本机(线路机)直连出口的 VLESS Reality 节点? (y/N)」，默认 N（与以前完全一样）。选 y 后再输入直连端口（回车随机，不能与中转端口相同，已占用的端口会提示换一个）和名称（默认 `直连-<线路机IP>`），会多出一个 `vless-direct-in` 入站（独立 UUID，复用同一套 Reality 密钥/SNI/short_id）走线路机本机出口；中转入站仍走落地机。两条链接都写入 `/etc/sing-box-relay/relay_uri.txt`，并分别标注「中转节点(出口落地机)」「直连节点(出口本机)」。之后可用 `sb` → 线路机菜单 5（或 `bash /etc/sing-box-relay/relay-install.sh direct`）添加/删除直连节点，`rename` 可选择改哪个节点的名称。**记得在云安全组放行两个端口。**
 > - **一条命令部署线路机**：落地机执行 `sb` → 选「生成线路机脚本(出口为本机ss协议)」（菜单编号随已启用的协议数量变化，例如只装了一个协议时是 10），脚本保存在落地机 `/root/relay-install.sh`（权限 600），默认不再刷屏输出整个脚本，而是给出分步说明和两种整行复制的方法：
 >   - 生成时会询问「落地机的 SSH 连接端口」（就是平时 SSH 登录落地机用的端口；NAT 机器填商家映射的端口，例如 45466，而不是机器内部的 22），保存为 `LANDING_SSH_PORT`，下次回车即沿用
 >   - 方法一（推荐，在线路机整行执行；线路机没有 ssh 客户端会先自动安装 openssh-client，bash/ash 均可）：
@@ -56,13 +56,47 @@
 > 1. 在**新的落地机**上 `sb` → 「生成线路机脚本(出口为本机ss协议)」，按提示用方法一或方法二在**线路机**上运行脚本。
 > 2. 线路机上已有中转节点时会出现「线路机管理」菜单，**直接回车选「1) 追加这台落地机为新的中转节点」**，再回车用随机端口和默认名称（默认 `中转-落地<落地机IP>`），确认即可。原有节点的端口/UUID/链接都不变，不需要重新导入。
 > 3. **在 Oracle 安全列表（Security List）放行新端口（TCP）**，脚本最后会用中文提示端口号；系统防火墙(ufw/firewalld/iptables)开着时会询问是否自动放行。
-> 4. 把新节点那一行 vless:// 链接导入小火箭。所有链接都在线路机 `/etc/sing-box/relay_uri.txt`。
+> 4. 把新节点那一行 vless:// 链接导入小火箭。所有链接都在线路机 `/etc/sing-box-relay/relay_uri.txt`。
 >
 > - 每多一台落地机就重复一次上面的步骤；同一台落地机（同地址+端口）不会重复添加，若它的 SS 密码/加密方式变了会提示原地更新（链接不变）。
-> - 以后在线路机运行 `bash /etc/sing-box/relay-install.sh` 管理（或带参数 `show` / `rename` / `delete` / `direct` / `append`）。
+> - 以后在线路机输入 `sb` 管理，或运行 `bash /etc/sing-box-relay/relay-install.sh`（可带参数 `show` / `rename` / `delete` / `direct` / `append` / `status` / `restart` / `upgrade` / `uninstall`）。
 > - 旧版线路机（只有一个中转节点）第一次运行新脚本时会自动把原节点登记为「节点 1」，端口/UUID/链接不变。
-> - 已经接入线路机的旧落地机**不需要**更新 `sb` 面板，只有用来生成新脚本的那台落地机需要更新。
+> - 已经接入线路机的旧落地机**不需要**为了中转而更新 `sb` 面板；但**用来生成新线路机脚本的那台落地机必须先更新 `sb` 面板**（旧面板生成的是旧版线路机脚本，会和新布局冲突）。
 > - 「9) 全部重新安装」会删除线路机上所有节点，需输入 `yes` 确认，只在想全部重来时使用。
+>
+> ### 🧩 落地机 + 线路机 共存在同一台机器，统一用 `sb` 管理
+>
+> 以前线路机节点和落地机节点都用 `/etc/sing-box/config.json` 和同一个 `sing-box` 服务，在一台机器上装了一种再装另一种就会互相覆盖。现在分开了：
+>
+> | | 落地机节点（一键脚本装的 SS/HY2/TUIC/Reality/AnyTLS） | 线路机节点（中转节点 + 直连节点） |
+> |---|---|---|
+> | 配置 | `/etc/sing-box/config.json` | `/etc/sing-box-relay/config.json` |
+> | 服务 | `sing-box` | `sing-box-relay`（systemd 和 Alpine OpenRC 都支持，同一个 sing-box 程序） |
+> | 链接 | `sb` → 1 | `/etc/sing-box-relay/relay_uri.txt`，或 `sb` → 线路机菜单 → 2 |
+> | 脚本 | `/usr/local/bin/sb` | `/etc/sing-box-relay/relay-install.sh`（旧路径 `/etc/sing-box/relay-install.sh` 自动转发） |
+>
+> - **任何机器都能两样都装**：落地机上可以再加线路机直连节点/中转节点；线路机上也可以再用一键脚本装落地机节点。两边选端口时会互相避开（落地机脚本不会用线路机已占用的端口，线路机脚本也不会用落地机已占用的端口）。
+> - **落地机上的 `sb`**：原有菜单编号不变，最后多一项「线路机/直连节点管理」（例如只装了 1 个协议时：10 = 生成线路机脚本，11 = 卸载，**12 = 线路机/直连节点管理**；装了 N 个协议时是 11+N）。也可以直接输入 `sb relay`。本机还没有线路机节点时，这里可以一键「在本机添加一个直连节点(VLESS Reality，出口本机)」。
+> - **只有线路机节点的机器**：线路机脚本会装一个简易 `sb` 快捷菜单：1 线路机管理 2 查看链接 3 添加/删除直连节点 4 重启线路机服务 5 查看状态 6 安装落地机节点 0 退出。选 6 装好落地机节点后，`sb` 自动变成完整面板（里面同样有「线路机/直连节点管理」）。已有完整 `sb` 面板时绝不会被快捷菜单覆盖。
+> - **卸载互不影响**：`sb` 里「卸载 sing-box(落地机节点)」会询问是否同时卸载线路机节点（默认保留，保留时 sing-box 程序也保留，`sb` 变回快捷菜单）；线路机菜单 8「卸载线路机节点」只删 `sing-box-relay`，不动落地机节点。
+> - **旧版线路机自动迁移**：检测到 `/etc/sing-box/relay.env`（旧版线路机才有）时，把线路机节点原样搬到 `/etc/sing-box-relay`，改由 `sing-box-relay` 服务运行，**端口、UUID、Reality 密钥、short_id、SNI、节点名称全部不变，客户端里的链接继续有效，不用重新导入**；原来只跑线路机节点的 `sing-box` 服务会被停用。新服务启动失败会自动还原成迁移前的样子。纯落地机（没有 relay.env）不会被当成线路机。
+>
+> **已有机器怎么升级（以 root 整行复制执行，不会改动任何节点）：**
+>
+> 1. **每台落地机**（例如 jpsb、gjp）：只更新 `sb` 面板（与下方 HY2 小节是同一条命令，不重装、不改节点）。之后 `sb` 菜单最后会多出「线路机/直连节点管理」：
+>
+> ```bash
+> curl -fsSL https://raw.githubusercontent.com/demonmanch/singbox-deploy/main/install-singbox-yyds.sh -o /tmp/sb-install.sh && awk '/<<.SB_SCRIPT.$/{f=1;next} /^SB_SCRIPT$/{f=0} f' /tmp/sb-install.sh > /tmp/sb.new && grep -q pinSHA256 /tmp/sb.new && bash -n /tmp/sb.new && cp /tmp/sb.new /usr/local/bin/sb && chmod +x /usr/local/bin/sb && ln -sf /usr/local/bin/sb /usr/bin/sb && rm -f /tmp/sb-install.sh /tmp/sb.new && echo "sb 面板已更新"
+> ```
+>
+> 2. **线路机**（例如春川 Oracle）：执行下面这一行。它会把旧版线路机节点迁移到独立服务 `sing-box-relay`（链接不变，中断约 1~2 秒），并装上 `sb` 快捷菜单，最后列出所有节点链接供核对：
+>
+> ```bash
+> curl -fsSL https://raw.githubusercontent.com/demonmanch/singbox-deploy/main/install-singbox-yyds.sh -o /tmp/sb-install.sh && awk '/<<.RELAY_EOF.$/{f=1;next} /^RELAY_EOF$/{f=0} f' /tmp/sb-install.sh > /tmp/relay.new && grep -q 'SVC_NAME="sing-box-relay"' /tmp/relay.new && bash -n /tmp/relay.new && bash /tmp/relay.new upgrade; rm -f /tmp/sb-install.sh /tmp/relay.new
+> ```
+>
+>    升级后检查：`sb` → 2 查看链接（应与以前完全一样）；Ubuntu/Debian 用 `systemctl status sing-box-relay`，Alpine 用 `rc-service sing-box-relay status`。这条命令可以重复执行，已迁移过的机器只会更新脚本副本。
+> 3. 以后再给线路机加落地机：照旧在（已更新面板的）落地机上 `sb` →「生成线路机脚本」，到线路机运行生成的命令并选「追加」。
 >
 > ### 📱 HY2 链接适配 v2rayNG（证书指纹 pinSHA256）
 >
