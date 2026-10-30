@@ -2234,6 +2234,1527 @@ action_uninstall() {
     info "卸载完成"
 }
 
+# 线路机脚本模板（落地机参数占位符未替换）：$1=写入路径
+# 线路机节点使用独立目录 /etc/sing-box-relay 和独立服务 sing-box-relay，和落地机节点互不覆盖
+write_relay_template() {
+    cat > "$1" <<'RELAY_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
+warn() { echo -e "\033[1;33m[WARN]\033[0m $*"; }
+err()  { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
+
+[ "$(id -u)" != "0" ] && err "必须以 root 运行" && exit 1
+
+# ===== 落地机参数（由落地机 sb 生成时填入）=====
+LANDING_SERVER='__INBOUND_IP__'
+LANDING_PORT='__INBOUND_PORT__'
+LANDING_METHOD='__INBOUND_METHOD__'
+LANDING_PASSWORD='__INBOUND_PASSWORD__'
+RELAY_SNI='__REALITY_SNI__'
+
+# 线路机(中转/直连)节点使用独立的目录和服务，和本机的落地机节点(/etc/sing-box + sing-box 服务)互不覆盖
+SB_DIR="/etc/sing-box-relay"
+CONFIG="$SB_DIR/config.json"
+RELAY_ENV="$SB_DIR/relay.env"            # 公共参数：线路机IP、Reality 公钥/short_id/SNI、直连节点
+RELAY_DIR="$SB_DIR/relays"               # 每台落地机一条记录: relays/<编号>.env
+RELAY_URI_FILE="$SB_DIR/relay_uri.txt"   # 所有节点链接（每次整体重写）
+SELF_COPY="$SB_DIR/relay-install.sh"
+SVC_NAME="sing-box-relay"
+SYSTEMD_UNIT="/etc/systemd/system/${SVC_NAME}.service"
+OPENRC_INIT="/etc/init.d/${SVC_NAME}"
+
+# 本机落地机节点（落地机一键脚本安装的）；旧版线路机也把配置放在这里
+LANDING_DIR="/etc/sing-box"
+LANDING_CONFIG="$LANDING_DIR/config.json"
+OLD_ENV="$LANDING_DIR/relay.env"
+OLD_RELAY_DIR="$LANDING_DIR/relays"
+SHIM="$LANDING_DIR/relay-install.sh"     # 兼容旧命令 bash /etc/sing-box/relay-install.sh
+SB_CMD="/usr/local/bin/sb"
+MAIN_URL="https://raw.githubusercontent.com/demonmanch/singbox-deploy/main/install-singbox-yyds.sh"
+
+# 只看文件开头的标记行（完整 sb 面板里也包含这些字样，不能用全文搜索判断）
+is_shortcut() { [ -f "$1" ] && head -n 3 "$1" 2>/dev/null | grep -q '^# SB_RELAY_SHORTCUT'; }
+is_shim() { [ -f "$1" ] && head -n 3 "$1" 2>/dev/null | grep -q '^# SB_RELAY_SHIM'; }
+
+# 直连节点默认关闭（旧版 relay.env 里没有这些字段）
+DIRECT_ENABLED=false
+DIRECT_PORT=""
+DIRECT_UUID=""
+DIRECT_NAME=""
+PUB_IP=""
+REALITY_PUB=""
+REALITY_SID=""
+RECORDS=()
+
+# 节点名称 URL 编码（支持中文/空格）
+uri_encode() { jq -rn --arg v "$1" '$v|@uri'; }
+
+valid_port() { [[ "$1" =~ ^[0-9]{1,5}$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
+
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# 本脚本里的落地机参数是否有效（模板未填写时无效）
+landing_valid() {
+    [ -n "$LANDING_SERVER" ] && [[ "$LANDING_SERVER" != __*__ ]] && valid_port "$LANDING_PORT" \
+        && [ -n "$LANDING_PASSWORD" ] && [[ "$LANDING_PASSWORD" != __*__ ]]
+}
+
+# 端口是否已被系统占用（检测不到工具时视为未占用）
+port_in_use() {
+    local addrs=""
+    if command -v ss >/dev/null 2>&1; then
+        addrs=$(ss -lntu 2>/dev/null | awk 'NR>1{print $5}' || true)
+    elif command -v netstat >/dev/null 2>&1; then
+        addrs=$(netstat -lntu 2>/dev/null | awk '{print $4}' || true)
+    fi
+    printf '%s\n' "$addrs" | grep -qE "[:.]$1\$"
+}
+
+# 端口是否写在某个 sing-box 配置里：$1=配置文件 $2=端口
+cfg_has_port() {
+    [ -f "$1" ] && command -v jq >/dev/null 2>&1 \
+        && jq -e --argjson p "$2" 'any((.inbounds // [])[]; .listen_port == $p)' "$1" >/dev/null 2>&1
+}
+
+# 端口是否已写在本机线路机配置里
+own_port() { cfg_has_port "$CONFIG" "$1"; }
+
+# 端口是否已被本机【落地机节点】(/etc/sing-box/config.json) 使用：任何情况下都不能用
+landing_port() { cfg_has_port "$LANDING_CONFIG" "$1"; }
+
+# 随机挑一个空闲端口：$1=需避开的端口(空格分隔) $2=strict(配置里已有的端口也避开)
+rand_free_port() {
+    local avoid=" ${1:-} " strict="${2:-}" p i
+    for i in $(seq 1 100); do
+        p=$(shuf -i 20000-65000 -n 1 2>/dev/null || echo $(( (RANDOM % 45000) + 20000 )))
+        [[ "$avoid" == *" $p "* ]] && continue
+        port_in_use "$p" && continue
+        landing_port "$p" && continue
+        if [ -n "$strict" ] && own_port "$p"; then continue; fi
+        echo "$p"
+        return 0
+    done
+    return 1
+}
+
+# 询问端口：$1=提示 $2=需避开的端口(空格分隔，可空) $3=strict(追加节点时：配置里已有的端口一律不能用)
+# 结果放在 ASKED_PORT
+ask_port() {
+    local prompt="$1" avoid=" ${2:-} " strict="${3:-}" p
+    while true; do
+        read -r -p "$prompt" p || { err "没有读到输入，已取消"; return 1; }
+        p=$(printf '%s' "$p" | tr -d '[:space:]')
+        if [ -z "$p" ]; then
+            p=$(rand_free_port "${2:-}" "$strict") || { err "没找到空闲端口，请手动输入"; continue; }
+            info "随机端口: $p"
+        fi
+        if ! valid_port "$p"; then err "端口无效: $p（需为 1-65535 的数字）"; continue; fi
+        p=$((10#$p))
+        if [[ "$avoid" == *" $p "* ]]; then err "端口 $p 已被本机其他节点使用，请换一个"; continue; fi
+        if landing_port "$p"; then err "端口 $p 已被本机的落地机节点($LANDING_CONFIG)使用，请换一个"; continue; fi
+        if [ -n "$strict" ]; then
+            if own_port "$p"; then err "端口 $p 已被本机线路机的其他节点使用，请换一个"; continue; fi
+            if port_in_use "$p"; then err "端口 $p 已被本机其他程序占用，请换一个"; continue; fi
+        elif port_in_use "$p" && ! own_port "$p"; then
+            err "端口 $p 已被占用，请换一个"; continue
+        fi
+        ASKED_PORT="$p"
+        return 0
+    done
+}
+
+set_pub_ip_uri() {
+    # IPv6 在链接里需要加方括号
+    if [[ "$PUB_IP" == *:* ]]; then PUB_IP_URI="[$PUB_IP]"; else PUB_IP_URI="$PUB_IP"; fi
+}
+
+make_link() {
+    # $1=uuid $2=port $3=name
+    echo "vless://$1@$PUB_IP_URI:$2?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$RELAY_SNI&fp=chrome&pbk=$REALITY_PUB&sid=$REALITY_SID#$(uri_encode "$3")"
+}
+
+new_uuid() { cat /proc/sys/kernel/random/uuid 2>/dev/null || sing-box generate uuid; }
+
+# ===== 每台落地机一条记录（relays/<编号>.env）=====
+list_records() {
+    RECORDS=()
+    [ -d "$RELAY_DIR" ] || return 0
+    local f
+    while IFS= read -r f; do
+        [ -n "$f" ] && RECORDS+=("$f")
+    done < <(find "$RELAY_DIR" -maxdepth 1 -type f -name '*.env' 2>/dev/null \
+        | awk -F/ '{n=$NF; sub(/\.env$/,"",n); if (n ~ /^[0-9]+$/) print n "\t" $0}' | sort -n | cut -f2-)
+    return 0
+}
+
+load_record() {
+    R_IDX=""; R_UUID=""; R_PORT=""; R_NAME=""; R_SERVER=""; R_SERVER_PORT=""
+    R_METHOD=""; R_PASSWORD=""; R_IN_TAG=""; R_OUT_TAG=""
+    # shellcheck disable=SC1090
+    . "$1"
+}
+
+save_record() {
+    mkdir -p "$RELAY_DIR"
+    chmod 700 "$RELAY_DIR" 2>/dev/null || true
+    {
+        printf 'R_IDX=%q\n' "$R_IDX"
+        printf 'R_UUID=%q\n' "$R_UUID"
+        printf 'R_PORT=%q\n' "$R_PORT"
+        printf 'R_NAME=%q\n' "$R_NAME"
+        printf 'R_SERVER=%q\n' "$R_SERVER"
+        printf 'R_SERVER_PORT=%q\n' "$R_SERVER_PORT"
+        printf 'R_METHOD=%q\n' "$R_METHOD"
+        printf 'R_PASSWORD=%q\n' "$R_PASSWORD"
+        printf 'R_IN_TAG=%q\n' "$R_IN_TAG"
+        printf 'R_OUT_TAG=%q\n' "$R_OUT_TAG"
+    } > "$RELAY_DIR/$R_IDX.env"
+    chmod 600 "$RELAY_DIR/$R_IDX.env"
+}
+
+# 公共参数写入 relay.env；UUID/LISTEN_PORT/NODE_NAME 保留第一个中转节点的值，兼容旧版脚本
+save_env() {
+    mkdir -p "$SB_DIR"
+    list_records
+    local c_uuid="" c_port="" c_name=""
+    if [ "${#RECORDS[@]}" -gt 0 ]; then
+        c_uuid=$(load_record "${RECORDS[0]}"; printf '%s' "$R_UUID")
+        c_port=$(load_record "${RECORDS[0]}"; printf '%s' "$R_PORT")
+        c_name=$(load_record "${RECORDS[0]}"; printf '%s' "$R_NAME")
+    fi
+    {
+        printf 'UUID=%q\n' "$c_uuid"
+        printf 'PUB_IP=%q\n' "$PUB_IP"
+        printf 'LISTEN_PORT=%q\n' "$c_port"
+        printf 'REALITY_PUB=%q\n' "$REALITY_PUB"
+        printf 'REALITY_SID=%q\n' "$REALITY_SID"
+        printf 'RELAY_SNI=%q\n' "$RELAY_SNI"
+        printf 'NODE_NAME=%q\n' "$c_name"
+        printf 'DIRECT_ENABLED=%q\n' "$DIRECT_ENABLED"
+        printf 'DIRECT_PORT=%q\n' "$DIRECT_PORT"
+        printf 'DIRECT_UUID=%q\n' "$DIRECT_UUID"
+        printf 'DIRECT_NAME=%q\n' "$DIRECT_NAME"
+        printf 'RELAY_FORMAT=%q\n' "2"
+    } > "$RELAY_ENV"
+    chmod 600 "$RELAY_ENV"
+}
+
+# 旧版（只有一个中转节点、没有 relays/ 目录）自动迁移为节点 1：端口/UUID/名称/链接都不变
+migrate_old() {
+    list_records
+    [ "${#RECORDS[@]}" -gt 0 ] && return 0
+    [ -n "${UUID:-}" ] && [ -n "${LISTEN_PORT:-}" ] || return 0
+    R_IDX=1
+    R_UUID="$UUID"
+    R_PORT="$LISTEN_PORT"
+    R_NAME="${NODE_NAME:-中转-$PUB_IP}"
+    R_IN_TAG="vless-in"
+    R_OUT_TAG="relay-out"
+    R_SERVER=""; R_SERVER_PORT=""; R_METHOD=""; R_PASSWORD=""
+    if [ -f "$CONFIG" ]; then
+        R_SERVER=$(jq -r '[(.outbounds // [])[] | select(.tag=="relay-out")][0].server // empty' "$CONFIG" 2>/dev/null || true)
+        R_SERVER_PORT=$(jq -r '[(.outbounds // [])[] | select(.tag=="relay-out")][0].server_port // empty' "$CONFIG" 2>/dev/null || true)
+        R_METHOD=$(jq -r '[(.outbounds // [])[] | select(.tag=="relay-out")][0].method // empty' "$CONFIG" 2>/dev/null || true)
+        R_PASSWORD=$(jq -r '[(.outbounds // [])[] | select(.tag=="relay-out")][0].password // empty' "$CONFIG" 2>/dev/null || true)
+    fi
+    save_record
+    list_records
+    info "已把旧版的中转节点登记为「节点 1」（端口 $R_PORT、UUID、链接都不变）"
+}
+
+load_env() {
+    if [ ! -f "$RELAY_ENV" ]; then
+        err "未找到 $RELAY_ENV，请先完成线路机安装"
+        return 1
+    fi
+    command -v jq >/dev/null 2>&1 || { err "需要 jq"; return 1; }
+    # shellcheck disable=SC1090
+    . "$RELAY_ENV"
+    set_pub_ip_uri
+    migrate_old
+}
+
+# 重新生成所有链接并整体重写 relay_uri.txt（不改动运行中的配置）
+build_links() {
+    set_pub_ip_uri
+    list_records
+    mkdir -p "$SB_DIR"
+    local f tmp="${RELAY_URI_FILE}.tmp"
+    : > "$tmp"
+    for f in ${RECORDS[@]+"${RECORDS[@]}"}; do
+        load_record "$f"
+        make_link "$R_UUID" "$R_PORT" "$R_NAME" >> "$tmp"
+    done
+    if [ "$DIRECT_ENABLED" = "true" ]; then
+        make_link "$DIRECT_UUID" "$DIRECT_PORT" "$DIRECT_NAME" >> "$tmp"
+    fi
+    mv "$tmp" "$RELAY_URI_FILE"
+}
+
+# 列出所有中转节点（编号从 1 开始，对应 RECORDS 下标+1）
+print_records() {
+    local i=0 f
+    for f in ${RECORDS[@]+"${RECORDS[@]}"}; do
+        i=$((i + 1))
+        load_record "$f"
+        echo "   $i) ${R_NAME}  | 线路机端口 ${R_PORT} → 落地机 ${R_SERVER:-未知}:${R_SERVER_PORT:-?}"
+    done
+}
+
+show_link() {
+    if [ -f "$RELAY_ENV" ] && command -v jq >/dev/null 2>&1; then
+        load_env
+        build_links
+        local i=0 f
+        for f in ${RECORDS[@]+"${RECORDS[@]}"}; do
+            i=$((i + 1))
+            load_record "$f"
+            echo "=============== 中转节点 $i (出口落地机 ${R_SERVER:-未知}:${R_SERVER_PORT:-?}) ==============="
+            echo "名称: $R_NAME    线路机端口: $R_PORT"
+            make_link "$R_UUID" "$R_PORT" "$R_NAME"
+        done
+        if [ "$DIRECT_ENABLED" = "true" ]; then
+            echo "=============== 直连节点(出口本机) ================="
+            echo "名称: $DIRECT_NAME    线路机端口: $DIRECT_PORT"
+            make_link "$DIRECT_UUID" "$DIRECT_PORT" "$DIRECT_NAME"
+        fi
+        echo "===================================================="
+        echo "所有链接也保存在: $RELAY_URI_FILE"
+    elif [ -f "$RELAY_URI_FILE" ]; then
+        echo "=============== 中转节点 Reality 链接 ==============="
+        cat "$RELAY_URI_FILE"
+        echo "===================================================="
+    else
+        err "未找到 $RELAY_URI_FILE"
+        return 1
+    fi
+}
+
+# 让用户从中转节点列表里选一个，结果放在 CHOSEN（记录文件路径）
+choose_record() {
+    local prompt="$1" n
+    CHOSEN=""
+    print_records
+    read -r -p "$prompt" n || return 1
+    if [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le "${#RECORDS[@]}" ]; then
+        CHOSEN="${RECORDS[$((n - 1))]}"
+        return 0
+    fi
+    err "无效选择: $n"
+    return 1
+}
+
+# 修改节点名称：只重新生成链接和 relay_uri.txt，不动 config.json / 服务
+rename_node() {
+    load_env || return 1
+    local which new_name f
+    echo "要修改哪个节点的名称?"
+    print_records
+    [ "$DIRECT_ENABLED" = "true" ] && echo "   d) 直连节点(出口本机): $DIRECT_NAME"
+    read -r -p "请输入编号(回车默认 1): " which || return 1
+    which="${which:-1}"
+    if [[ "$which" =~ ^[Dd]$ ]] && [ "$DIRECT_ENABLED" = "true" ]; then
+        read -r -p "请输入新的直连节点名称(回车保持「$DIRECT_NAME」): " new_name || true
+        DIRECT_NAME="${new_name:-$DIRECT_NAME}"
+        info "✅ 直连节点名称: $DIRECT_NAME（未改动运行中的配置）"
+    elif [[ "$which" =~ ^[0-9]+$ ]] && [ "$which" -ge 1 ] && [ "$which" -le "${#RECORDS[@]}" ]; then
+        f="${RECORDS[$((which - 1))]}"
+        load_record "$f"
+        read -r -p "请输入新的中转节点名称(回车保持「$R_NAME」): " new_name || true
+        R_NAME="${new_name:-$R_NAME}"
+        save_record
+        info "✅ 中转节点 $which 名称: $R_NAME（未改动运行中的配置）"
+    else
+        err "无效选择: $which"
+        return 1
+    fi
+    save_env
+    build_links
+    show_link
+}
+
+# ===== 服务管理：独立服务 sing-box-relay（systemd 或 OpenRC），与落地机的 sing-box 服务互不影响 =====
+svc_kind() {
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        echo systemd
+    elif command -v rc-service >/dev/null 2>&1; then
+        echo openrc
+    elif command -v systemctl >/dev/null 2>&1; then
+        echo systemd
+    else
+        echo none
+    fi
+}
+
+singbox_bin() { command -v sing-box 2>/dev/null || echo /usr/bin/sing-box; }
+
+# 写入服务文件并设置开机自启（不启动）
+install_service() {
+    local bin
+    bin=$(singbox_bin)
+    case "$(svc_kind)" in
+        openrc)
+            cat > "$OPENRC_INIT" <<SVC
+#!/sbin/openrc-run
+name="${SVC_NAME}"
+description="sing-box relay (线路机中转/直连节点)"
+command="${bin}"
+command_args="run -c ${CONFIG}"
+command_background="yes"
+pidfile="/run/${SVC_NAME}.pid"
+output_log="/var/log/${SVC_NAME}.log"
+error_log="/var/log/${SVC_NAME}.err"
+supervisor=supervise-daemon
+supervise_daemon_args="--respawn-max 0 --respawn-delay 5"
+
+depend() {
+    need net
+    after firewall
+}
+SVC
+            chmod +x "$OPENRC_INIT"
+            rc-update add "$SVC_NAME" default >/dev/null 2>&1 || warn "添加开机自启失败: rc-update add $SVC_NAME default"
+            ;;
+        systemd)
+            cat > "$SYSTEMD_UNIT" <<SVC
+[Unit]
+Description=sing-box relay (线路机中转/直连节点)
+After=network.target nss-lookup.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=${SB_DIR}
+ExecStart=${bin} run -c ${CONFIG}
+Restart=on-failure
+RestartSec=10s
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+SVC
+            systemctl daemon-reload || true
+            systemctl enable "$SVC_NAME" >/dev/null 2>&1 || warn "设置开机自启失败: systemctl enable $SVC_NAME"
+            ;;
+        *)
+            warn "未检测到 systemd / OpenRC，无法创建服务；请自行运行: $(singbox_bin) run -c $CONFIG"
+            return 1
+            ;;
+    esac
+}
+
+service_installed() { [ -f "$SYSTEMD_UNIT" ] || [ -f "$OPENRC_INIT" ]; }
+
+svc_restart() {
+    service_installed || install_service || return 1
+    case "$(svc_kind)" in
+        openrc) rc-service "$SVC_NAME" restart ;;
+        systemd) systemctl restart "$SVC_NAME" ;;
+        *) return 1 ;;
+    esac
+}
+
+svc_stop() {
+    case "$(svc_kind)" in
+        openrc) rc-service "$SVC_NAME" stop >/dev/null 2>&1 || true ;;
+        systemd) systemctl stop "$SVC_NAME" >/dev/null 2>&1 || true ;;
+    esac
+}
+
+svc_active() {
+    case "$(svc_kind)" in
+        openrc) rc-service "$SVC_NAME" status >/dev/null 2>&1 ;;
+        systemd) systemctl is-active "$SVC_NAME" >/dev/null 2>&1 ;;
+        *) return 1 ;;
+    esac
+}
+
+svc_status() {
+    case "$(svc_kind)" in
+        openrc) rc-service "$SVC_NAME" status || true; tail -n 20 "/var/log/${SVC_NAME}.err" 2>/dev/null || true ;;
+        systemd) systemctl status "$SVC_NAME" --no-pager || true ;;
+        *) warn "未检测到 systemd / OpenRC" ;;
+    esac
+}
+
+# 关闭并删除本服务（卸载用）
+remove_service() {
+    svc_stop
+    case "$(svc_kind)" in
+        openrc) rc-update del "$SVC_NAME" default >/dev/null 2>&1 || true ;;
+        systemd) systemctl disable "$SVC_NAME" >/dev/null 2>&1 || true ;;
+    esac
+    rm -f "$OPENRC_INIT" "$SYSTEMD_UNIT"
+    if [ "$(svc_kind)" = "systemd" ]; then systemctl daemon-reload >/dev/null 2>&1 || true; fi
+}
+
+# 落地机的 sing-box 服务（仅迁移旧版线路机时使用）
+landing_svc() {
+    # $1 = stop | start | restart | disable | active
+    case "$(svc_kind):$1" in
+        openrc:disable) rc-update del sing-box default >/dev/null 2>&1 || true ;;
+        openrc:active) rc-service sing-box status >/dev/null 2>&1 ;;
+        openrc:*) rc-service sing-box "$1" ;;
+        systemd:disable) systemctl disable sing-box >/dev/null 2>&1 || true ;;
+        systemd:active) systemctl is-active sing-box >/dev/null 2>&1 ;;
+        systemd:*) systemctl "$1" sing-box ;;
+        *) return 1 ;;
+    esac
+}
+
+check_config() {
+    if command -v sing-box >/dev/null 2>&1 && ! sing-box check -c "$CONFIG"; then
+        return 1
+    fi
+    return 0
+}
+
+backup_config() {
+    BAK="${CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
+    [ -e "$BAK" ] && BAK="${BAK}-$$-$RANDOM"
+    cp "$CONFIG" "$BAK"
+}
+
+# 校验新配置，通过则重启；失败则从备份还原并报错
+apply_or_restore() {
+    if ! check_config; then
+        err "新配置校验失败(sing-box check)，已从备份还原: $BAK，运行中的服务未改动"
+        cp "$BAK" "$CONFIG"
+        return 1
+    fi
+    info "配置校验通过（修改前已备份到: $BAK），正在重启 $SVC_NAME（本机落地机节点不受影响）..."
+    svc_restart || warn "重启失败，请检查: sing-box check -c $CONFIG"
+    return 0
+}
+
+save_self_copy() {
+    # 保存一份脚本副本，方便以后管理: bash /etc/sing-box-relay/relay-install.sh（或输入 sb）
+    mkdir -p "$SB_DIR"
+    if [ -f "$0" ] && [ "$(readlink -f "$0")" != "$(readlink -f "$SELF_COPY" 2>/dev/null || echo "$SELF_COPY")" ]; then
+        if cp "$0" "$SELF_COPY" 2>/dev/null; then chmod 700 "$SELF_COPY" || true; fi
+    fi
+    write_shim
+    install_shortcut
+}
+
+# 兼容旧命令: bash /etc/sing-box/relay-install.sh ... 转到新位置（只在 /etc/sing-box 目录存在时写）
+write_shim() {
+    [ -d "$LANDING_DIR" ] || return 0
+    [ -f "$SELF_COPY" ] || return 0
+    cat > "$SHIM" <<'SHIM_EOF'
+#!/usr/bin/env bash
+# SB_RELAY_SHIM: 线路机脚本已迁移到 /etc/sing-box-relay/relay-install.sh（独立服务 sing-box-relay）
+exec bash /etc/sing-box-relay/relay-install.sh "$@"
+SHIM_EOF
+    chmod 700 "$SHIM" 2>/dev/null || true
+}
+
+# 本机没有 sb 时安装一个简易 sb 快捷菜单；已有完整 sb 面板(落地机脚本装的)或别的 sb 命令时绝不覆盖
+# $1=force：卸载落地机后用来补回快捷菜单（仍然不会覆盖完整面板）
+install_shortcut() {
+    local fresh=true
+    if [ -e "$SB_CMD" ] || [ -L "$SB_CMD" ]; then
+        is_shortcut "$SB_CMD" || return 0
+        fresh=false
+    fi
+    [ -f "$SELF_COPY" ] || return 0
+    mkdir -p "$(dirname "$SB_CMD")"
+    cat > "$SB_CMD" <<'SB_SHORTCUT'
+#!/usr/bin/env bash
+# SB_RELAY_SHORTCUT: 线路机脚本生成的简易 sb 快捷菜单。
+# 在本机安装落地机节点后，会被完整的 sb 管理面板替换（完整面板里同样有「线路机/直连节点管理」）。
+RELAY=/etc/sing-box-relay/relay-install.sh
+MAIN_URL=https://raw.githubusercontent.com/demonmanch/singbox-deploy/main/install-singbox-yyds.sh
+if [ "$(id -u)" != "0" ]; then echo "请以 root 运行 sb"; exit 1; fi
+case "${1:-}" in
+    relay) shift; exec bash "$RELAY" "$@" ;;
+esac
+while true; do
+    echo ""
+    echo "=========================="
+    echo " sb 快捷菜单（线路机）"
+    echo "=========================="
+    echo "1) 线路机管理(追加/查看/改名/删除中转节点、直连节点)"
+    echo "2) 查看线路机所有节点链接"
+    echo "3) 添加/删除直连节点(出口本机)"
+    echo "4) 重启线路机服务(sing-box-relay)"
+    echo "5) 查看线路机服务状态"
+    echo "6) 安装落地机节点(运行落地机一键脚本，不影响线路机节点)"
+    echo "0) 退出"
+    echo "=========================="
+    read -r -p "请输入选项: " opt || exit 0
+    case "$opt" in
+        1) bash "$RELAY" menu || true ;;
+        2) bash "$RELAY" show || true ;;
+        3) bash "$RELAY" direct || true ;;
+        4) bash "$RELAY" restart || true ;;
+        5) bash "$RELAY" status || true ;;
+        6)
+            tmp=$(mktemp /tmp/sb-install.XXXXXX) || exit 1
+            if curl -fsSL "$MAIN_URL" -o "$tmp" && bash -n "$tmp"; then
+                bash "$tmp"
+                rc=$?
+                rm -f "$tmp"
+                # 安装成功后 /usr/local/bin/sb 已换成完整面板
+                if [ "$rc" -eq 0 ] && [ -f /usr/local/bin/sb ] && ! head -n 3 /usr/local/bin/sb | grep -q '^# SB_RELAY_SHORTCUT'; then
+                    echo "落地机节点已安装，sb 已升级为完整管理面板（里面有「线路机/直连节点管理」）"
+                    exit 0
+                fi
+            else
+                rm -f "$tmp"
+                echo "下载落地机脚本失败: $MAIN_URL"
+            fi
+            ;;
+        0) exit 0 ;;
+        *) echo "无效选项: $opt" ;;
+    esac
+done
+SB_SHORTCUT
+    chmod +x "$SB_CMD"
+    if [ ! -e /usr/bin/sb ] || [ -L /usr/bin/sb ]; then ln -sf "$SB_CMD" /usr/bin/sb 2>/dev/null || true; fi
+    if $fresh; then info "已安装 sb 快捷菜单: 以后输入 sb 即可管理线路机节点 / 安装落地机节点"; fi
+}
+
+# 提醒放行端口；系统防火墙开着时询问是否自动放行
+firewall_reminder() {
+    local p ans
+    echo ""
+    warn "=================== ⚠️ 重要：放行端口 ==================="
+    warn "请在云厂商安全组放行端口(TCP): $*  ，否则节点连不上！"
+    echo "   Oracle 甲骨文云: 控制台 → 网络(Networking) → 虚拟云网络(Virtual Cloud Networks)"
+    echo "   → 点你的 VCN → 安全列表(Security Lists) → Default Security List → 添加入站规则(Add Ingress Rules)"
+    echo "   源 CIDR 填 0.0.0.0/0，IP 协议选 TCP，目标端口范围填上面的端口号 → 保存"
+    for p in "$@"; do
+        if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+            read -r -p "检测到系统防火墙 ufw 已开启，是否自动放行 ${p}/tcp?(Y/n): " ans || ans=n
+            [[ "$ans" =~ ^[Nn]$ ]] || ufw allow "${p}/tcp" || true
+        elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+            read -r -p "检测到系统防火墙 firewalld 已开启，是否自动放行 ${p}/tcp?(Y/n): " ans || ans=n
+            if [[ ! "$ans" =~ ^[Nn]$ ]]; then
+                if firewall-cmd --permanent --add-port="${p}/tcp"; then firewall-cmd --reload || true; fi
+            fi
+        elif command -v iptables >/dev/null 2>&1 && iptables -S INPUT 2>/dev/null | grep -q -- '-j REJECT' \
+            && ! iptables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null; then
+            read -r -p "检测到系统 iptables 有拦截规则(Oracle 的 Ubuntu 镜像默认如此)，是否自动放行 ${p}/tcp?(Y/n): " ans || ans=n
+            if [[ ! "$ans" =~ ^[Nn]$ ]]; then
+                iptables -I INPUT -p tcp --dport "$p" -j ACCEPT || true
+                if command -v netfilter-persistent >/dev/null 2>&1; then
+                    netfilter-persistent save >/dev/null 2>&1 || true
+                else
+                    warn "iptables 规则重启后可能失效；如需永久生效请安装 iptables-persistent"
+                fi
+            fi
+        fi
+    done
+    warn "========================================================"
+}
+
+# 本机现有的 Reality 设置（新节点复用同一套密钥/SNI/short_id，链接里的 pbk/sid 与 relay.env 一致）
+REALITY_TLS_JQ='([(.inbounds // [])[] | select(.type=="vless" and (.tls.reality.enabled // false))] | sort_by(if .tag=="vless-direct-in" then 1 else 0 end) | .[0].tls)'
+
+# 向 config.json 加入直连 inbound（复用中转节点的 Reality 密钥/SNI/short_id）和路由规则
+apply_direct_config() {
+    local tmp="${CONFIG}.tmp"
+    jq --argjson port "$DIRECT_PORT" --arg uuid "$DIRECT_UUID" "
+      $REALITY_TLS_JQ as \$tls
+      | if \$tls == null then error(\"本机配置里没有 Reality 入站\") else . end
+      | .inbounds = ([(.inbounds // [])[] | select(.tag != \"vless-direct-in\")] + [{
+          \"type\": \"vless\",
+          \"listen\": \"::\",
+          \"listen_port\": \$port,
+          \"users\": [{ \"uuid\": \$uuid, \"flow\": \"xtls-rprx-vision\" }],
+          \"tls\": \$tls,
+          \"tag\": \"vless-direct-in\"
+        }])
+      | .outbounds = ((.outbounds // []) | if any(.[]; .tag==\"direct-out\") then . else . + [{\"type\":\"direct\",\"tag\":\"direct-out\"}] end)
+      | .route.rules = ([(.route.rules // [])[] | select(.inbound != \"vless-direct-in\")] + [{ \"inbound\": \"vless-direct-in\", \"outbound\": \"direct-out\" }])
+    " "$CONFIG" > "$tmp" && mv "$tmp" "$CONFIG"
+}
+
+remove_direct_config() {
+    local tmp="${CONFIG}.tmp"
+    jq '
+      .inbounds = [(.inbounds // [])[] | select(.tag != "vless-direct-in")]
+      | .route.rules = [(.route.rules // [])[] | select(.inbound != "vless-direct-in")]
+    ' "$CONFIG" > "$tmp" && mv "$tmp" "$CONFIG"
+}
+
+# 询问直连节点端口/名称（结果写入 DIRECT_* 变量）：$1=需避开的端口 $2=strict
+ask_direct() {
+    ask_port "请输入直连节点监听端口(回车随机 20000-65000，不能与中转端口相同): " "${1:-}" "${2:-}" || return 1
+    DIRECT_PORT="$ASKED_PORT"
+    DIRECT_UUID=$(new_uuid)
+    local def="直连-$PUB_IP" n
+    read -r -p "请输入直连节点名称/备注(回车默认「$def」): " n || true
+    DIRECT_NAME="${n:-$def}"
+    DIRECT_ENABLED=true
+}
+
+# 添加/删除直连节点（会修改 config.json 并重启 sing-box-relay，修改前自动备份）
+# 本机还没有线路机节点时：只装一个直连节点（落地机上也可以用，独立服务，不影响落地机节点）
+manage_direct() {
+    if [ ! -f "$RELAY_ENV" ]; then
+        info "本机还没有线路机(中转/直连)节点，将新建一个直连节点：VLESS Reality，出口为本机"
+        info "它使用独立的目录 $SB_DIR 和服务 $SVC_NAME，不会改动本机已有的落地机节点"
+        fresh_install direct
+        return $?
+    fi
+    load_env || return 1
+    need_tools || return 1
+    local ans
+    if [ "$DIRECT_ENABLED" = "true" ]; then
+        echo "当前已有直连节点(出口本机)，端口: $DIRECT_PORT，名称: $DIRECT_NAME"
+        read -r -p "是否删除该直连节点?(y/N): " ans || ans=n
+        [[ "$ans" =~ ^[Yy]$ ]] || { info "已取消"; return 0; }
+        if [ "${#RECORDS[@]}" -eq 0 ]; then
+            err "直连节点是本机线路机服务里唯一的节点，不能单独删除。如需全部删除，请在线路机菜单选「卸载线路机节点」。"
+            return 1
+        fi
+        backup_config
+        remove_direct_config
+        apply_or_restore || return 1
+        DIRECT_ENABLED=false; DIRECT_PORT=""; DIRECT_UUID=""; DIRECT_NAME=""
+    else
+        ask_direct "" strict || return 1
+        backup_config
+        if ! apply_direct_config; then
+            err "写入直连节点失败，已还原: $BAK"
+            cp "$BAK" "$CONFIG"
+            return 1
+        fi
+        apply_or_restore || return 1
+    fi
+    save_env
+    build_links
+    save_self_copy
+    show_link
+    if [ "$DIRECT_ENABLED" = "true" ]; then
+        firewall_reminder "$DIRECT_PORT"
+    fi
+    return 0
+}
+
+find_dup() {
+    DUP_FILE=""
+    landing_valid || return 1
+    local f s
+    s=$(lower "$LANDING_SERVER")
+    for f in ${RECORDS[@]+"${RECORDS[@]}"}; do
+        load_record "$f"
+        if [ "$(lower "$R_SERVER")" = "$s" ] && [ "$R_SERVER_PORT" = "$LANDING_PORT" ]; then
+            DUP_FILE="$f"
+            return 0
+        fi
+    done
+    return 1
+}
+
+need_tools() {
+    command -v jq >/dev/null 2>&1 || { err "未找到 jq，请先安装: apk add jq 或 apt-get install -y jq"; return 1; }
+    command -v sing-box >/dev/null 2>&1 || { err "未找到 sing-box，请选择「全部重新安装」"; return 1; }
+    [ -f "$CONFIG" ] || { err "未找到 $CONFIG，请选择「全部重新安装」"; return 1; }
+}
+
+# 已存在的落地机：用本脚本里的新 SS 密码/加密方式原地更新
+update_dup() {
+    load_record "$DUP_FILE"
+    local ans idx="$R_IDX" pos=0 i=0 f
+    for f in ${RECORDS[@]+"${RECORDS[@]}"}; do i=$((i + 1)); [ "$f" = "$DUP_FILE" ] && pos=$i; done
+    echo ""
+    warn "这台落地机 ${LANDING_SERVER}:${LANDING_PORT} 已经添加过了：中转节点 $pos「$R_NAME」(线路机端口 $R_PORT)，不会重复添加。"
+    if [ "$R_METHOD" = "$LANDING_METHOD" ] && [ "$R_PASSWORD" = "$LANDING_PASSWORD" ]; then
+        info "SS 加密方式和密码也都一样，无需修改。下面是现有链接："
+        show_link
+        return 0
+    fi
+    echo "   落地机的 SS 参数有变化: 加密方式 ${R_METHOD:-未知} → $LANDING_METHOD，密码也将更新为本次脚本里的值"
+    read -r -p "是否更新该节点的 SS 密码/加密方式?(链接不变，Y/n): " ans || ans=n
+    [[ "$ans" =~ ^[Nn]$ ]] && { info "已取消"; return 0; }
+    backup_config
+    if ! jq --arg t "$R_OUT_TAG" --arg m "$LANDING_METHOD" --arg p "$LANDING_PASSWORD" \
+        '.outbounds = [(.outbounds // [])[] | if .tag == $t then (.method = $m | .password = $p) else . end]' \
+        "$CONFIG" > "${CONFIG}.tmp"; then
+        rm -f "${CONFIG}.tmp"; err "修改失败，配置未改动"; return 1
+    fi
+    mv "${CONFIG}.tmp" "$CONFIG"
+    apply_or_restore || return 1
+    R_IDX="$idx"; R_METHOD="$LANDING_METHOD"; R_PASSWORD="$LANDING_PASSWORD"
+    save_record
+    save_self_copy
+    info "✅ 已更新中转节点 $pos 的 SS 参数，客户端链接不变，无需重新导入"
+    return 0
+}
+
+# 追加本脚本对应的落地机为新的中转节点（不动已有的入站/出站/直连节点）
+append_node() {
+    load_env || return 1
+    need_tools || return 1
+    if ! landing_valid; then
+        err "本脚本里没有有效的落地机参数（是线路机上保存的副本？）。请到【新落地机】上运行 sb → 生成线路机脚本，再把新脚本拿到本机运行。"
+        return 1
+    fi
+    list_records
+    if find_dup; then
+        update_dup
+        return $?
+    fi
+    if [ -z "$(jq -r "$REALITY_TLS_JQ | .reality.private_key // empty" "$CONFIG")" ]; then
+        err "$CONFIG 里没有 Reality 入站，无法追加。请选择「全部重新安装」"
+        return 1
+    fi
+
+    # 新编号 = 现有最大编号 + 1；tag 与配置里已有的不冲突
+    local max=0 f idx in_tag out_tag def name ans
+    for f in ${RECORDS[@]+"${RECORDS[@]}"}; do
+        load_record "$f"
+        [[ "$R_IDX" =~ ^[0-9]+$ ]] && [ "$R_IDX" -gt "$max" ] && max="$R_IDX"
+    done
+    idx=$((max + 1))
+    while true; do
+        if [ "$idx" -eq 1 ]; then in_tag="vless-in"; out_tag="relay-out"; else in_tag="vless-in-$idx"; out_tag="relay-out-$idx"; fi
+        if [ ! -f "$RELAY_DIR/$idx.env" ] && ! jq -e --arg a "$in_tag" --arg b "$out_tag" \
+            'any((.inbounds // [])[]; .tag == $a) or any((.outbounds // [])[]; .tag == $b)' "$CONFIG" >/dev/null; then
+            break
+        fi
+        idx=$((idx + 1))
+    done
+
+    echo ""
+    info "=== 追加新的中转节点：线路机 → 落地机 ${LANDING_SERVER}:${LANDING_PORT} ==="
+    echo "   已有节点不受影响（端口/UUID/链接都不变）。"
+    ask_port "请输入新中转节点的监听端口(回车随机 20000-65000，不能和已有节点相同): " "" strict || return 1
+    R_PORT="$ASKED_PORT"
+    def="中转-落地${LANDING_SERVER}"
+    read -r -p "请输入新中转节点名称/备注(回车默认「$def」): " name || true
+    R_NAME="${name:-$def}"
+    R_IDX="$idx"
+    R_UUID=$(new_uuid)
+    R_SERVER="$LANDING_SERVER"
+    R_SERVER_PORT="$LANDING_PORT"
+    R_METHOD="$LANDING_METHOD"
+    R_PASSWORD="$LANDING_PASSWORD"
+    R_IN_TAG="$in_tag"
+    R_OUT_TAG="$out_tag"
+
+    echo ""
+    echo "   新节点: 名称「$R_NAME」，线路机端口 $R_PORT，落地机 ${R_SERVER}:${R_SERVER_PORT} ($R_METHOD)"
+    read -r -p "确认追加?(Y/n): " ans || ans=n
+    [[ "$ans" =~ ^[Nn]$ ]] && { info "已取消"; return 0; }
+
+    backup_config
+    if ! jq --argjson port "$R_PORT" --arg uuid "$R_UUID" --arg itag "$R_IN_TAG" --arg otag "$R_OUT_TAG" \
+        --arg server "$R_SERVER" --argjson sport "$R_SERVER_PORT" --arg method "$R_METHOD" --arg pw "$R_PASSWORD" "
+      $REALITY_TLS_JQ as \$tls
+      | .inbounds = ((.inbounds // []) + [{
+          \"type\": \"vless\",
+          \"listen\": \"::\",
+          \"listen_port\": \$port,
+          \"users\": [{ \"uuid\": \$uuid, \"flow\": \"xtls-rprx-vision\" }],
+          \"tls\": \$tls,
+          \"tag\": \$itag
+        }])
+      | .outbounds = ((.outbounds // []) + [{
+          \"type\": \"shadowsocks\",
+          \"server\": \$server,
+          \"server_port\": \$sport,
+          \"method\": \$method,
+          \"password\": \$pw,
+          \"tag\": \$otag
+        }])
+      | .route.rules = ((.route.rules // []) + [{ \"inbound\": \$itag, \"outbound\": \$otag }])
+    " "$CONFIG" > "${CONFIG}.tmp"; then
+        rm -f "${CONFIG}.tmp"
+        err "生成新配置失败，配置未改动"
+        return 1
+    fi
+    mv "${CONFIG}.tmp" "$CONFIG"
+    apply_or_restore || return 1
+
+    save_record
+    save_env
+    build_links
+    save_self_copy
+    echo ""
+    info "✅ 已追加中转节点「$R_NAME」（线路机端口 $R_PORT → 落地机 ${R_SERVER}:${R_SERVER_PORT}）"
+    show_link
+    echo ""
+    info "👉 新节点的链接是上面「名称: $R_NAME」下面那一行，复制到小火箭(Shadowrocket)导入即可；旧节点不用动。"
+    firewall_reminder "$R_PORT"
+    return 0
+}
+
+# 删除某个中转节点（至少保留一个）
+# 删除某个中转节点（线路机服务里至少保留一个节点）
+delete_node() {
+    load_env || return 1
+    need_tools || return 1
+    local ans pos del_port
+    if [ "${#RECORDS[@]}" -eq 0 ]; then
+        err "本机没有中转节点"
+        return 1
+    fi
+    if [ "${#RECORDS[@]}" -le 1 ] && [ "$DIRECT_ENABLED" != "true" ]; then
+        err "本机只有 1 个中转节点，不能删除最后一个。如需全部删除，请选择「卸载线路机节点」；如需重来，请选择「全部重新安装」。"
+        return 1
+    fi
+    echo "要删除哪个中转节点?"
+    choose_record "请输入编号(其他键取消): " || { info "已取消"; return 0; }
+    load_record "$CHOSEN"
+    pos="$R_NAME"
+    del_port="$R_PORT"
+    warn "将删除中转节点「$pos」(线路机端口 $R_PORT → 落地机 ${R_SERVER:-未知}:${R_SERVER_PORT:-?})，它的链接会失效。"
+    read -r -p "确认删除?(y/N): " ans || ans=n
+    [[ "$ans" =~ ^[Yy]$ ]] || { info "已取消"; return 0; }
+    backup_config
+    if ! jq --arg itag "$R_IN_TAG" --arg otag "$R_OUT_TAG" '
+      .inbounds = [(.inbounds // [])[] | select(.tag != $itag)]
+      | .outbounds = [(.outbounds // [])[] | select(.tag != $otag)]
+      | .route.rules = [(.route.rules // [])[] | select(.inbound != $itag and .outbound != $otag)]
+    ' "$CONFIG" > "${CONFIG}.tmp"; then
+        rm -f "${CONFIG}.tmp"; err "修改失败，配置未改动"; return 1
+    fi
+    mv "${CONFIG}.tmp" "$CONFIG"
+    apply_or_restore || return 1
+    rm -f "$CHOSEN"
+    save_env
+    build_links
+    save_self_copy
+    info "✅ 已删除中转节点「$pos」。可以顺手到 Oracle 安全列表里删掉端口 $del_port 的放行规则（可选）。"
+    show_link
+}
+
+# 「全部重新安装」前的确认
+confirm_overwrite() {
+    local ans
+    echo ""
+    warn "⚠️ 全部重新安装：会删除本机【所有】线路机中转节点和直连节点，只为本次这台落地机(${LANDING_SERVER}:${LANDING_PORT})新建 1 个节点！"
+    warn "   所有旧的线路机链接都会失效，需要重新导入。旧配置会自动备份(config.json.bak.时间戳)。本机落地机节点不受影响。"
+    warn "   如果只是想再加一台落地机，请不要选这个，而是选「追加」。"
+    read -r -p "确定要全部重新安装吗? 请输入 yes 确认(其他任意键取消): " ans || ans=""
+    [ "$ans" = "yes" ]
+}
+
+# ===== 旧版布局迁移：线路机节点原来放在 /etc/sing-box（与落地机共用 sing-box 服务）=====
+# 中转入站 = 路由规则里出站为 relay-out* 的入站，再加直连入站 vless-direct-in
+RELAY_TAGS_JQ='[ ((.route.rules // [])[] | select((.outbound // "") | tostring | startswith("relay-out")) | (.inbound // empty) | if type == "array" then .[] else . end), "vless-direct-in" ] | unique'
+
+# 配置里是否有线路机节点（relay-out* 出站或直连入站）
+cfg_has_relay() {
+    [ -f "$1" ] && jq -e 'any((.outbounds // [])[]; (.tag // "") | startswith("relay-out")) or any((.inbounds // [])[]; .tag == "vless-direct-in")' "$1" >/dev/null 2>&1
+}
+
+need_migrate() { [ -f "$OLD_ENV" ] && [ ! -f "$RELAY_ENV" ]; }
+
+# 把 /etc/sing-box 里的线路机相关文件挪到备份目录（不删除）
+move_old_relay_files() {
+    local dest="$1" f
+    mkdir -p "$dest"
+    chmod 700 "$dest" 2>/dev/null || true
+    for f in "$OLD_ENV" "$OLD_RELAY_DIR" "$LANDING_DIR/relay_uri.txt" "$LANDING_DIR/relay_uri.txt.tmp"; do
+        [ -e "$f" ] && mv "$f" "$dest/" 2>/dev/null || true
+    done
+    # 旧的脚本副本（不是新版转发小脚本时）
+    if [ -f "$SHIM" ] && ! is_shim "$SHIM"; then
+        mv "$SHIM" "$dest/relay-install.sh.old" 2>/dev/null || true
+    fi
+}
+
+# 等待服务启动并检查
+wait_active() {
+    local i
+    for i in 1 2 3 4 5; do
+        "$@" && return 0
+        sleep 1
+    done
+    return 1
+}
+
+relay_active() { svc_active; }
+landing_active() { landing_svc active; }
+
+# 旧配置被落地机脚本覆盖、线路机记录还在时：从 config.json.bak.* 里找最新一份含线路机节点的配置
+find_relay_backup() {
+    local f
+    for f in $(ls -1t "$LANDING_DIR"/config.json.bak* 2>/dev/null || true); do
+        cfg_has_relay "$f" && { printf '%s' "$f"; return 0; }
+    done
+    return 1
+}
+
+migrate_layout() {
+    command -v jq >/dev/null 2>&1 || { err "迁移需要 jq，请先安装: apk add jq 或 apt-get install -y jq"; return 1; }
+    local ts tags n_land src="$LANDING_CONFIG" bk ans p kind f
+    ts=$(date +%Y%m%d%H%M%S)
+    kind=$(svc_kind)
+    echo ""
+    info "=== 检测到旧版线路机（节点在 $LANDING_DIR，和落地机共用 sing-box 服务）==="
+    info "正在迁移到独立目录 $SB_DIR + 独立服务 $SVC_NAME："
+    info "端口、UUID、Reality 密钥、short_id、SNI、节点名称全部不变，客户端里已有的链接继续有效。"
+
+    if ! cfg_has_relay "$LANDING_CONFIG"; then
+        warn "$LANDING_DIR 里有线路机记录(relay.env)，但 $LANDING_CONFIG 里已经没有线路机节点（可能被落地机脚本覆盖了）。"
+        if bk=$(find_relay_backup); then
+            echo "   找到含线路机节点的旧配置备份: $bk"
+            read -r -p "是否用这份备份恢复线路机节点(放到独立服务 $SVC_NAME，不影响落地机节点)?(y/N): " ans || ans=n
+            if [[ "$ans" =~ ^[Yy]$ ]]; then
+                src="$bk"
+            fi
+        fi
+        if [ "$src" = "$LANDING_CONFIG" ]; then
+            move_old_relay_files "$LANDING_DIR/relay-stale-backup.$ts"
+            warn "已把过期的线路机记录挪到 $LANDING_DIR/relay-stale-backup.$ts（落地机节点未改动）"
+            return 0
+        fi
+    fi
+
+    tags=$(jq -c "$RELAY_TAGS_JQ" "$src") || { err "读取 $src 失败，未做任何修改"; return 1; }
+    n_land=$(jq --argjson tags "$tags" '[(.inbounds // [])[] | select((.tag // "") as $t | ($tags | index($t)) == null)] | length' "$src")
+    [ "$src" != "$LANDING_CONFIG" ] && n_land=0
+
+    rm -rf "${SB_DIR}.migrating"
+    mkdir -p "${SB_DIR}.migrating"
+    chmod 700 "${SB_DIR}.migrating"
+    if [ "$n_land" -eq 0 ]; then
+        # 纯线路机：原样复制配置，保证完全不变
+        cp "$src" "${SB_DIR}.migrating/config.json"
+    else
+        info "本机 $LANDING_CONFIG 里同时有落地机节点($n_land 个入站)，只把线路机节点拆分出去"
+        jq --argjson tags "$tags" '
+          .inbounds = [(.inbounds // [])[] | select((.tag // "") as $t | ($tags | index($t)) != null)]
+          | .outbounds = [(.outbounds // [])[] | select(((.tag // "") | startswith("relay-out")) or .tag == "direct-out")]
+          | (if any(.outbounds[]; .tag == "direct-out") then . else .outbounds += [{"type":"direct","tag":"direct-out"}] end)
+          | .route = ((.route // {}) | .rules = [(.rules // [])[] | select(((.inbound // "") | if type == "array" then .[0] else . end) as $i | ($tags | index($i)) != null)])
+        ' "$src" > "${SB_DIR}.migrating/config.json"
+        jq --argjson tags "$tags" '
+          .inbounds = [(.inbounds // [])[] | select((.tag // "") as $t | ($tags | index($t)) == null)]
+          | .outbounds = [(.outbounds // [])[] | select(((.tag // "") | startswith("relay-out")) | not)]
+          | .route = ((.route // {}) | .rules = [(.rules // [])[] | select(((.inbound // "") | if type == "array" then .[0] else . end) as $i | ($tags | index($i)) == null)])
+        ' "$src" > "${SB_DIR}.migrating/landing.json"
+        if command -v sing-box >/dev/null 2>&1 && ! sing-box check -c "${SB_DIR}.migrating/landing.json"; then
+            err "拆分后的落地机配置校验失败，未做任何修改"
+            rm -rf "${SB_DIR}.migrating"
+            return 1
+        fi
+    fi
+    if command -v sing-box >/dev/null 2>&1 && ! sing-box check -c "${SB_DIR}.migrating/config.json"; then
+        err "迁移后的线路机配置校验失败，未做任何修改"
+        rm -rf "${SB_DIR}.migrating"
+        return 1
+    fi
+    if [ "$src" != "$LANDING_CONFIG" ]; then
+        # 从备份恢复：端口不能和现在的落地机节点冲突
+        for p in $(jq -r '(.inbounds // [])[].listen_port // empty' "${SB_DIR}.migrating/config.json"); do
+            if landing_port "$p"; then
+                err "备份里的线路机端口 $p 已被现在的落地机节点使用，无法恢复。未做任何修改"
+                rm -rf "${SB_DIR}.migrating"
+                return 1
+            fi
+        done
+    fi
+    for f in "$OLD_ENV" "$LANDING_DIR/relay_uri.txt"; do
+        [ -f "$f" ] && cp -p "$f" "${SB_DIR}.migrating/"
+    done
+    [ -d "$OLD_RELAY_DIR" ] && cp -a "$OLD_RELAY_DIR" "${SB_DIR}.migrating/relays"
+
+    # 已有 /etc/sing-box-relay 且里面有配置/节点记录（之前失败的残留等）先整体挪开；只有脚本副本时直接合并
+    if [ -e "$SB_DIR/config.json" ] || [ -e "$SB_DIR/relays" ]; then
+        mv "$SB_DIR" "${SB_DIR}.old.$ts"
+    fi
+    if [ -d "$SB_DIR" ]; then
+        cp -a "${SB_DIR}.migrating/." "$SB_DIR/"
+        rm -rf "${SB_DIR}.migrating"
+    else
+        mv "${SB_DIR}.migrating" "$SB_DIR"
+    fi
+    install_service || { mv "$SB_DIR" "${SB_DIR}.failed.$ts"; err "创建 $SVC_NAME 服务失败，未做任何修改"; return 1; }
+
+    local landing_bak="${LANDING_CONFIG}.bak.premigrate.$ts"
+    if [ "$src" = "$LANDING_CONFIG" ]; then
+        cp -p "$LANDING_CONFIG" "$landing_bak"
+        # 先停旧服务释放端口，再启动新服务（中断约几秒）
+        landing_svc stop >/dev/null 2>&1 || true
+        if [ "$n_land" -gt 0 ]; then
+            mv "$SB_DIR/landing.json" "$LANDING_CONFIG"
+        fi
+    fi
+    rm -f "$SB_DIR/landing.json"
+
+    local ok=true
+    svc_restart >/dev/null 2>&1 || ok=false
+    $ok && { wait_active relay_active || ok=false; }
+    if $ok && [ "$src" = "$LANDING_CONFIG" ] && [ "$n_land" -gt 0 ]; then
+        landing_svc restart >/dev/null 2>&1 || ok=false
+        $ok && { wait_active landing_active || ok=false; }
+    fi
+    if ! $ok; then
+        err "新服务 $SVC_NAME 启动失败，正在还原为迁移前的状态..."
+        svc_status
+        remove_service
+        mv "$SB_DIR" "${SB_DIR}.failed.$ts"
+        if [ "$src" = "$LANDING_CONFIG" ]; then
+            cp -p "$landing_bak" "$LANDING_CONFIG"
+            landing_svc restart >/dev/null 2>&1 || landing_svc start >/dev/null 2>&1 || true
+        fi
+        err "已还原，线路机节点仍由原来的 sing-box 服务运行。失败的文件保存在 ${SB_DIR}.failed.$ts"
+        return 1
+    fi
+
+    if [ "$src" = "$LANDING_CONFIG" ] && [ "$n_land" -eq 0 ]; then
+        # 纯线路机：原来的 sing-box 服务只跑线路机节点，迁移后关闭它；旧配置改名保留
+        landing_svc disable
+        mv "$LANDING_CONFIG" "$SB_DIR/migrated-config.json.$ts" 2>/dev/null || true
+        rm -f "$landing_bak"
+        local b
+        for b in "$LANDING_DIR"/config.json.bak.*; do
+            [ -f "$b" ] || continue
+            mkdir -p "$SB_DIR/old-backups"
+            mv "$b" "$SB_DIR/old-backups/" 2>/dev/null || true
+        done
+    fi
+    move_old_relay_files "$SB_DIR/migrated-from-etc-sing-box.$ts"
+    save_self_copy
+    # /root/relay-install.sh 是旧版脚本时：备份后换成转发小脚本，免得以后误运行旧版另装一套
+    if [ -f /root/relay-install.sh ] && ! grep -q 'SVC_NAME="sing-box-relay"' /root/relay-install.sh 2>/dev/null \
+        && ! is_shim /root/relay-install.sh && [ -f "$SHIM" ]; then
+        mv /root/relay-install.sh "/root/relay-install.sh.old.$ts" && cp "$SHIM" /root/relay-install.sh \
+            && info "   旧版 /root/relay-install.sh 已备份为 /root/relay-install.sh.old.$ts，现在运行它会自动转到新脚本"
+    fi
+    info "✅ 迁移完成：线路机节点现在由独立服务 $SVC_NAME 运行（配置 $CONFIG）"
+    [ "$kind" = "openrc" ] && info "   管理: rc-service $SVC_NAME status|restart   日志: /var/log/$SVC_NAME.log"
+    [ "$kind" = "systemd" ] && info "   管理: systemctl status|restart $SVC_NAME   日志: journalctl -u $SVC_NAME"
+    if [ "$n_land" -eq 0 ] && [ "$src" = "$LANDING_CONFIG" ]; then
+        info "   原来的 sing-box 服务已停用（它只跑线路机节点）。以后可以在本机用落地机脚本安装落地机节点，二者互不覆盖。"
+    fi
+    return 0
+}
+
+maybe_migrate() {
+    need_migrate || return 0
+    migrate_layout
+}
+
+# 更新本机线路机脚本副本 + 迁移旧版布局 + 服务文件/快捷命令（不改节点）
+do_upgrade() {
+    if [ ! -f "$RELAY_ENV" ]; then
+        info "本机没有线路机节点，无需升级。（在本机添加直连节点: 运行本脚本并加参数 direct，或输入 sb）"
+        return 0
+    fi
+    load_env || return 1
+    mkdir -p "$SB_DIR"
+    save_self_copy
+    if ! service_installed; then install_service || true; fi
+    if ! svc_active; then svc_restart || warn "启动 $SVC_NAME 失败，请运行: bash $SELF_COPY status"; fi
+    info "✅ 线路机脚本已更新到 $SELF_COPY（节点、端口、链接都没有改动）"
+    echo "   以后管理: 输入 sb（或 bash $SELF_COPY）"
+    show_link
+}
+
+# 卸载线路机节点（只删 sing-box-relay，不动落地机节点）
+uninstall_relay() {
+    local ans
+    if [ ! -d "$SB_DIR" ] && ! service_installed; then
+        info "本机没有安装线路机节点"
+        return 0
+    fi
+    warn "将删除本机【所有】线路机中转节点和直连节点（服务 $SVC_NAME、目录 $SB_DIR），它们的链接会失效。"
+    warn "本机的落地机节点($LANDING_CONFIG、sing-box 服务)不受影响。"
+    read -r -p "确认卸载线路机节点?(y/N): " ans || ans=n
+    [[ "$ans" =~ ^[Yy]$ ]] || { info "已取消"; return 0; }
+    remove_service
+    rm -rf "$SB_DIR"
+    rm -f "/var/log/${SVC_NAME}.log" "/var/log/${SVC_NAME}.err"
+    if is_shim "$SHIM"; then rm -f "$SHIM"; fi
+    if is_shortcut "$SB_CMD"; then
+        rm -f "$SB_CMD"
+        if [ -L /usr/bin/sb ] && [ ! -e /usr/bin/sb ]; then rm -f /usr/bin/sb; fi
+    fi
+    info "✅ 线路机节点已卸载"
+    if [ ! -f "$LANDING_CONFIG" ]; then
+        info "本机也没有落地机节点；sing-box 程序保留在 $(singbox_bin)，不需要可自行删除"
+    fi
+}
+
+# 安装/管理本机的落地机节点：已有完整 sb 面板就打开它，否则下载落地机一键脚本运行
+open_landing() {
+    if [ -f "$SB_CMD" ] && ! is_shortcut "$SB_CMD" && [ -f "$LANDING_CONFIG" ]; then
+        exec bash "$SB_CMD"
+    fi
+    info "将下载并运行落地机一键脚本（安装落地机节点到 $LANDING_DIR，不影响本机线路机节点）"
+    local tmp rc=0
+    tmp=$(mktemp /tmp/sb-install.XXXXXX)
+    if curl -fsSL "$MAIN_URL" -o "$tmp" && bash -n "$tmp"; then
+        bash "$tmp" || rc=$?
+    else
+        err "下载落地机脚本失败: $MAIN_URL"
+        rc=1
+    fi
+    rm -f "$tmp"
+    return "$rc"
+}
+
+relay_menu() {
+    load_env || return 1
+    local choice
+    echo ""
+    echo "==================== 线路机管理 ===================="
+    echo "本机线路机现有 ${#RECORDS[@]} 个中转节点（服务 $SVC_NAME，配置 $CONFIG）:"
+    print_records
+    [ "$DIRECT_ENABLED" = "true" ] && echo "   另有直连节点(出口本机): $DIRECT_NAME | 端口 $DIRECT_PORT"
+    if landing_valid; then
+        echo "本次脚本对应的落地机: ${LANDING_SERVER}:${LANDING_PORT}"
+        echo "----------------------------------------------------"
+        if find_dup; then
+            echo "1) 这台落地机已添加过 → 检查/更新它的 SS 密码(不会重复添加)"
+        else
+            echo "1) 追加这台落地机为新的中转节点（推荐，已有节点不受影响）"
+        fi
+    else
+        echo "----------------------------------------------------"
+        echo "1) 追加新的落地机（需用新落地机 sb 生成的脚本，本副本无落地机参数）"
+    fi
+    echo "2) 查看所有节点链接"
+    echo "3) 修改节点名称"
+    echo "4) 删除某个中转节点"
+    echo "5) 添加/删除直连节点(出口本机)"
+    echo "6) 重启线路机服务 / 查看状态"
+    echo "7) 安装/管理本机的落地机节点(sb 完整面板)"
+    echo "8) 卸载线路机节点(不影响落地机节点)"
+    echo "9) ⚠️ 全部重新安装（删除所有线路机节点，旧链接全部失效）"
+    echo "0) 退出"
+    echo "===================================================="
+    read -r -p "请选择(直接回车 = 1): " choice || choice=0
+    case "${choice:-1}" in
+        1) append_node; return $? ;;
+        2) show_link; return $? ;;
+        3) rename_node; return $? ;;
+        4) delete_node; return $? ;;
+        5) manage_direct; return $? ;;
+        6) svc_restart && info "已重启 $SVC_NAME"; svc_status; return 0 ;;
+        7) open_landing; return $? ;;
+        8) uninstall_relay; return $? ;;
+        9)
+            if ! landing_valid; then
+                err "本脚本里没有有效的落地机参数。请在落地机上运行 sb → 生成线路机脚本，再用新脚本重新安装。"
+                return 1
+            fi
+            confirm_overwrite || { info "已取消"; return 0; }
+            fresh_install relay
+            return $?
+            ;;
+        *) return 0 ;;
+    esac
+}
+
+usage() {
+    echo "用法: bash $SELF_COPY [命令]"
+    echo "  (无参数)/menu  线路机管理菜单"
+    echo "  append    追加本脚本对应的落地机为中转节点"
+    echo "  show      查看所有节点链接"
+    echo "  rename    修改节点名称"
+    echo "  delete    删除某个中转节点"
+    echo "  direct    添加/删除直连节点(本机没有线路机节点时新建一个直连节点)"
+    echo "  restart / status   重启 / 查看线路机服务 $SVC_NAME"
+    echo "  upgrade   迁移旧版布局并更新脚本副本(不改节点)"
+    echo "  landing   安装/管理本机的落地机节点"
+    echo "  uninstall 卸载线路机节点(不影响落地机节点)"
+    echo "  install   全部重新安装(删除所有线路机节点)"
+}
+
+# ===== 全新安装 / 全部重新安装 =====
+detect_os(){
+    . /etc/os-release 2>/dev/null || true
+    case "${ID:-}" in
+        alpine) OS=alpine ;;
+        debian|ubuntu) OS=debian ;;
+        centos|rhel|fedora) OS=redhat ;;
+        *) OS=unknown ;;
+    esac
+}
+
+# 默认 Reality SNI：本脚本里的值 > 本机落地机用的 SNI > addons.mozilla.org
+default_sni() {
+    local s="$RELAY_SNI"
+    if [ -z "$s" ] || [[ "$s" == __*__ ]]; then
+        s=$( (. "$LANDING_DIR/.config_cache" >/dev/null 2>&1; printf '%s' "${REALITY_SNI:-}") 2>/dev/null || true)
+    fi
+    printf '%s' "${s:-addons.mozilla.org}"
+}
+
+# $1 = relay（中转节点 + 可选直连节点）| direct（只有直连节点）
+fresh_install() {
+    local what="$1" ADD_DIRECT="" UUID REALITY_KEYS REALITY_PK LISTEN_PORT=0 NODE_NAME DEFAULT_NAME ip_url sni_in
+    if [ "$what" = "relay" ] && ! landing_valid; then
+        err "本脚本里没有有效的落地机参数。请在落地机上运行 sb → 生成线路机脚本。"
+        return 1
+    fi
+    DIRECT_ENABLED=false; DIRECT_PORT=""; DIRECT_UUID=""; DIRECT_NAME=""
+    detect_os
+
+    if ! command -v jq >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1 || ! command -v openssl >/dev/null 2>&1; then
+        info "安装依赖..."
+        case "$OS" in
+            alpine) apk update; apk add --no-cache curl jq bash openssl ca-certificates ;;
+            debian) apt-get update -y; apt-get install -y curl jq bash openssl ca-certificates ;;
+            redhat) yum install -y curl jq bash openssl ca-certificates ;;
+        esac
+    fi
+
+    if command -v sing-box >/dev/null 2>&1; then
+        info "本机已安装 sing-box: $(sing-box version 2>/dev/null | head -n1)（与落地机节点共用同一个程序）"
+    else
+        info "安装 sing-box..."
+        case "$OS" in
+            alpine) apk add --repository=http://dl-cdn.alpinelinux.org/alpine/edge/community sing-box ;;
+            *) bash <(curl -fsSL https://sing-box.app/install.sh) ;;
+        esac
+    fi
+    command -v sing-box >/dev/null 2>&1 || { err "sing-box 安装失败"; return 1; }
+
+    UUID=$(new_uuid)
+
+    info "生成 Reality 密钥对"
+    REALITY_KEYS=$(sing-box generate reality-keypair 2>/dev/null || echo "")
+    REALITY_PK=$(echo "$REALITY_KEYS" | grep "PrivateKey" | awk '{print $NF}' | tr -d '\r' || echo "")
+    REALITY_PUB=$(echo "$REALITY_KEYS" | grep "PublicKey" | awk '{print $NF}' | tr -d '\r' || echo "")
+    REALITY_SID=$(sing-box generate rand 8 --hex 2>/dev/null || echo "0123456789abcdef")
+    if [ -z "$REALITY_PK" ] || [ -z "$REALITY_PUB" ]; then
+        err "生成 Reality 密钥失败，请检查 sing-box 是否安装成功"
+        return 1
+    fi
+
+    if [ "$what" = "direct" ]; then
+        RELAY_SNI=$(default_sni)
+        read -r -p "请输入直连节点的 Reality SNI(回车默认 $RELAY_SNI): " sni_in || sni_in=""
+        sni_in=$(printf '%s' "$sni_in" | tr -d '[:space:]')
+        RELAY_SNI="${sni_in:-$RELAY_SNI}"
+    else
+        ask_port "请输入线路机(中转节点)监听端口(留空随机 20000-65000): " "" || return 1
+        LISTEN_PORT="$ASKED_PORT"
+    fi
+
+    PUB_IP=""
+    for ip_url in https://api.ipify.org https://api64.ipify.org https://icanhazip.com; do
+        PUB_IP=$(curl -s --max-time 5 "$ip_url" 2>/dev/null | tr -d '[:space:]' || true)
+        # 只接受像 IP 的结果（防止把错误页面写进链接）
+        if [[ "$PUB_IP" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || [[ "$PUB_IP" =~ ^[0-9A-Fa-f:]+$ && "$PUB_IP" == *:*:* ]]; then
+            break
+        fi
+        PUB_IP=""
+    done
+    [ -z "$PUB_IP" ] && PUB_IP="YOUR_RELAY_IP"
+    set_pub_ip_uri
+
+    if [ "$what" = "direct" ]; then
+        ask_direct "" || return 1
+    else
+        DEFAULT_NAME="中转-落地${LANDING_SERVER}"
+        read -r -p "请输入中转节点名称/备注(显示在链接 # 后，回车默认「$DEFAULT_NAME」): " NODE_NAME || true
+        NODE_NAME="${NODE_NAME:-$DEFAULT_NAME}"
+
+        echo ""
+        read -r -p "是否同时添加一个本机(线路机)直连出口的 VLESS Reality 节点? (y/N): " ADD_DIRECT || ADD_DIRECT=n
+        if [[ "$ADD_DIRECT" =~ ^[Yy]$ ]]; then
+            ask_direct "$LISTEN_PORT" || return 1
+        fi
+    fi
+
+    mkdir -p "$SB_DIR"
+    chmod 700 "$SB_DIR" 2>/dev/null || true
+
+    BAK=""
+    if [ -f "$CONFIG" ]; then
+        BAK="${CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
+        warn "将覆盖已有的 $CONFIG，旧配置已备份到: $BAK"
+        cp "$CONFIG" "$BAK"
+    fi
+
+    if [ "$what" = "direct" ]; then
+        # 只有直连节点：入站 vless-direct-in → 出站 direct-out
+        jq -n \
+          --argjson port "$DIRECT_PORT" \
+          --arg uuid "$DIRECT_UUID" \
+          --arg sni "$RELAY_SNI" \
+          --arg pk "$REALITY_PK" \
+          --arg sid "$REALITY_SID" '
+{
+  "log": { "level": "info", "timestamp": true },
+  "inbounds": [
+    {
+      "type": "vless",
+      "listen": "::",
+      "listen_port": $port,
+      "users": [{ "uuid": $uuid, "flow": "xtls-rprx-vision" }],
+      "tls": {
+        "enabled": true,
+        "server_name": $sni,
+        "reality": {
+          "enabled": true,
+          "handshake": { "server": $sni, "server_port": 443 },
+          "private_key": $pk,
+          "short_id": [$sid]
+        }
+      },
+      "tag": "vless-direct-in"
+    }
+  ],
+  "outbounds": [ { "type": "direct", "tag": "direct-out" } ],
+  "route": { "rules": [{ "inbound": "vless-direct-in", "outbound": "direct-out" }] }
+}' > "$CONFIG"
+    else
+        # 用 jq 生成配置，避免密码中的特殊字符破坏 JSON
+        jq -n \
+          --argjson listen_port "$LISTEN_PORT" \
+          --arg uuid "$UUID" \
+          --arg sni "$RELAY_SNI" \
+          --arg pk "$REALITY_PK" \
+          --arg sid "$REALITY_SID" \
+          --arg server "$LANDING_SERVER" \
+          --argjson server_port "$LANDING_PORT" \
+          --arg method "$LANDING_METHOD" \
+          --arg password "$LANDING_PASSWORD" '
+{
+  "log": { "level": "info", "timestamp": true },
+  "inbounds": [
+    {
+      "type": "vless",
+      "listen": "::",
+      "listen_port": $listen_port,
+      "users": [{ "uuid": $uuid, "flow": "xtls-rprx-vision" }],
+      "tls": {
+        "enabled": true,
+        "server_name": $sni,
+        "reality": {
+          "enabled": true,
+          "handshake": { "server": $sni, "server_port": 443 },
+          "private_key": $pk,
+          "short_id": [$sid]
+        }
+      },
+      "tag": "vless-in"
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "shadowsocks",
+      "server": $server,
+      "server_port": $server_port,
+      "method": $method,
+      "password": $password,
+      "tag": "relay-out"
+    },
+    { "type": "direct", "tag": "direct-out" }
+  ],
+  "route": { "rules": [{ "inbound": "vless-in", "outbound": "relay-out" }] }
+}' > "$CONFIG"
+
+        if [ "$DIRECT_ENABLED" = "true" ]; then
+            apply_direct_config
+        fi
+    fi
+
+    if ! check_config; then
+        if [ -n "$BAK" ]; then
+            cp "$BAK" "$CONFIG"
+            err "sing-box 配置校验未通过，已还原旧配置: $BAK（未重启服务）"
+        else
+            mv "$CONFIG" "${CONFIG}.invalid"
+            err "sing-box 配置校验未通过，错误的配置已保存为 ${CONFIG}.invalid"
+        fi
+        return 1
+    fi
+
+    install_service || true
+    svc_restart || warn "启动 $SVC_NAME 失败，请运行: bash $SELF_COPY status 查看"
+
+    # 保存参数并生成链接：旧的节点记录(如果有)挪到备份目录，新建节点 1
+    if [ -d "$RELAY_DIR" ]; then
+        mv "$RELAY_DIR" "${RELAY_DIR}.bak.$(date +%Y%m%d%H%M%S)"
+    fi
+    if [ "$what" = "relay" ]; then
+        R_IDX=1; R_UUID="$UUID"; R_PORT="$LISTEN_PORT"; R_NAME="$NODE_NAME"
+        R_SERVER="$LANDING_SERVER"; R_SERVER_PORT="$LANDING_PORT"; R_METHOD="$LANDING_METHOD"; R_PASSWORD="$LANDING_PASSWORD"
+        R_IN_TAG="vless-in"; R_OUT_TAG="relay-out"
+        save_record
+    fi
+    save_env
+    build_links
+    save_self_copy
+
+    echo ""
+    info "✅ 安装完成（线路机节点使用独立服务 $SVC_NAME，不影响本机落地机节点）"
+    show_link
+    echo ""
+    info "💡 链接已保存到: $RELAY_URI_FILE"
+    info "💡 以后管理(查看/改名/删除/直连节点): 输入 sb，或 bash $SELF_COPY"
+    info "💡 再加一台落地机: 在新落地机上 sb → 生成线路机脚本，把新脚本拿到本机运行，选「1) 追加」"
+    if [ "$what" = "direct" ]; then
+        firewall_reminder "$DIRECT_PORT"
+    elif [ "$DIRECT_ENABLED" = "true" ]; then
+        firewall_reminder "$LISTEN_PORT" "$DIRECT_PORT"
+    else
+        firewall_reminder "$LISTEN_PORT"
+    fi
+    return 0
+}
+
+# ===== 入口 =====
+MODE="${1:-}"
+case "$MODE" in
+    help|-h|--help) usage; exit 0 ;;
+    shortcut) install_shortcut; exit 0 ;;
+esac
+
+# 旧版线路机（节点在 /etc/sing-box）先迁移到独立目录/服务；迁移失败就停下，绝不另装一套
+maybe_migrate || exit 1
+
+case "$MODE" in
+    rename) rename_node; exit $? ;;
+    show|link) show_link; exit $? ;;
+    direct) manage_direct; exit $? ;;
+    append|add) append_node; exit $? ;;
+    delete|del|remove) delete_node; exit $? ;;
+    upgrade|migrate) do_upgrade; exit $? ;;
+    uninstall) uninstall_relay; exit $? ;;
+    restart) svc_restart && info "已重启 $SVC_NAME"; svc_status; exit 0 ;;
+    status) svc_status; exit 0 ;;
+    landing) open_landing; exit $? ;;
+    install)
+        if [ -f "$RELAY_ENV" ]; then
+            confirm_overwrite || { info "已取消"; exit 0; }
+        fi
+        fresh_install relay; exit $?
+        ;;
+    menu|"") ;;
+    *) err "未知参数: $MODE"; usage; exit 1 ;;
+esac
+
+if [ -f "$RELAY_ENV" ]; then
+    relay_menu
+    exit $?
+fi
+
+if landing_valid; then
+    fresh_install relay
+    exit $?
+fi
+
+# 模板脚本（没有落地机参数）且本机还没有线路机节点
+echo ""
+echo "本机还没有线路机节点，且本脚本没有落地机参数。"
+echo "1) 在本机添加一个直连节点(VLESS Reality，出口本机；独立服务，不影响落地机节点)"
+echo "0) 退出"
+echo "（要中转某台落地机: 在那台落地机上 sb → 生成线路机脚本，再把生成的命令拿到本机运行）"
+read -r -p "请选择: " choice || choice=0
+case "$choice" in
+    1) manage_direct; exit $? ;;
+    *) exit 0 ;;
+esac
+RELAY_EOF
+}
+
 # 生成线路机脚本
 action_generate_relay() {
     read_config || return 1
@@ -2462,910 +3983,7 @@ action_generate_relay() {
 
     info "正在生成线路机脚本: $RELAY_SCRIPT"
 
-    cat > "$RELAY_SCRIPT" <<'RELAY_EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-
-info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
-warn() { echo -e "\033[1;33m[WARN]\033[0m $*"; }
-err()  { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
-
-[ "$(id -u)" != "0" ] && err "必须以 root 运行" && exit 1
-
-# ===== 落地机参数（由落地机 sb 生成时填入）=====
-LANDING_SERVER='__INBOUND_IP__'
-LANDING_PORT='__INBOUND_PORT__'
-LANDING_METHOD='__INBOUND_METHOD__'
-LANDING_PASSWORD='__INBOUND_PASSWORD__'
-RELAY_SNI='__REALITY_SNI__'
-
-SB_DIR="/etc/sing-box"
-CONFIG="$SB_DIR/config.json"
-RELAY_ENV="$SB_DIR/relay.env"            # 公共参数：线路机IP、Reality 公钥/short_id/SNI、直连节点
-RELAY_DIR="$SB_DIR/relays"               # 每台落地机一条记录: relays/<编号>.env
-RELAY_URI_FILE="$SB_DIR/relay_uri.txt"   # 所有节点链接（每次整体重写）
-SELF_COPY="$SB_DIR/relay-install.sh"
-
-# 直连节点默认关闭（旧版 relay.env 里没有这些字段）
-DIRECT_ENABLED=false
-DIRECT_PORT=""
-DIRECT_UUID=""
-DIRECT_NAME=""
-PUB_IP=""
-REALITY_PUB=""
-REALITY_SID=""
-RECORDS=()
-
-# 节点名称 URL 编码（支持中文/空格）
-uri_encode() { jq -rn --arg v "$1" '$v|@uri'; }
-
-valid_port() { [[ "$1" =~ ^[0-9]{1,5}$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
-
-lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
-
-# 本脚本里的落地机参数是否有效（模板未填写时无效）
-landing_valid() {
-    [ -n "$LANDING_SERVER" ] && [[ "$LANDING_SERVER" != __*__ ]] && valid_port "$LANDING_PORT" \
-        && [ -n "$LANDING_PASSWORD" ] && [[ "$LANDING_PASSWORD" != __*__ ]]
-}
-
-# 端口是否已被系统占用（检测不到工具时视为未占用）
-port_in_use() {
-    local addrs=""
-    if command -v ss >/dev/null 2>&1; then
-        addrs=$(ss -lntu 2>/dev/null | awk 'NR>1{print $5}' || true)
-    elif command -v netstat >/dev/null 2>&1; then
-        addrs=$(netstat -lntu 2>/dev/null | awk '{print $4}' || true)
-    fi
-    printf '%s\n' "$addrs" | grep -qE "[:.]$1\$"
-}
-
-# 端口是否已写在本机 sing-box 配置里
-own_port() {
-    [ -f "$CONFIG" ] && command -v jq >/dev/null 2>&1 \
-        && jq -e --argjson p "$1" 'any((.inbounds // [])[]; .listen_port == $p)' "$CONFIG" >/dev/null 2>&1
-}
-
-# 随机挑一个空闲端口：$1=需避开的端口(空格分隔) $2=strict(配置里已有的端口也避开)
-rand_free_port() {
-    local avoid=" ${1:-} " strict="${2:-}" p i
-    for i in $(seq 1 100); do
-        p=$(shuf -i 20000-65000 -n 1 2>/dev/null || echo $(( (RANDOM % 45000) + 20000 )))
-        [[ "$avoid" == *" $p "* ]] && continue
-        port_in_use "$p" && continue
-        if [ -n "$strict" ] && own_port "$p"; then continue; fi
-        echo "$p"
-        return 0
-    done
-    return 1
-}
-
-# 询问端口：$1=提示 $2=需避开的端口(空格分隔，可空) $3=strict(追加节点时：配置里已有的端口一律不能用)
-# 结果放在 ASKED_PORT
-ask_port() {
-    local prompt="$1" avoid=" ${2:-} " strict="${3:-}" p
-    while true; do
-        read -r -p "$prompt" p || { err "没有读到输入，已取消"; return 1; }
-        p=$(printf '%s' "$p" | tr -d '[:space:]')
-        if [ -z "$p" ]; then
-            p=$(rand_free_port "${2:-}" "$strict") || { err "没找到空闲端口，请手动输入"; continue; }
-            info "随机端口: $p"
-        fi
-        if ! valid_port "$p"; then err "端口无效: $p（需为 1-65535 的数字）"; continue; fi
-        if [[ "$avoid" == *" $p "* ]]; then err "端口 $p 已被本机其他节点使用，请换一个"; continue; fi
-        if [ -n "$strict" ]; then
-            if own_port "$p"; then err "端口 $p 已被本机 sing-box 的其他节点使用，请换一个"; continue; fi
-            if port_in_use "$p"; then err "端口 $p 已被本机其他程序占用，请换一个"; continue; fi
-        elif port_in_use "$p" && ! own_port "$p"; then
-            err "端口 $p 已被占用，请换一个"; continue
-        fi
-        ASKED_PORT="$p"
-        return 0
-    done
-}
-
-set_pub_ip_uri() {
-    # IPv6 在链接里需要加方括号
-    if [[ "$PUB_IP" == *:* ]]; then PUB_IP_URI="[$PUB_IP]"; else PUB_IP_URI="$PUB_IP"; fi
-}
-
-make_link() {
-    # $1=uuid $2=port $3=name
-    echo "vless://$1@$PUB_IP_URI:$2?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$RELAY_SNI&fp=chrome&pbk=$REALITY_PUB&sid=$REALITY_SID#$(uri_encode "$3")"
-}
-
-new_uuid() { cat /proc/sys/kernel/random/uuid 2>/dev/null || sing-box generate uuid; }
-
-# ===== 每台落地机一条记录（relays/<编号>.env）=====
-list_records() {
-    RECORDS=()
-    [ -d "$RELAY_DIR" ] || return 0
-    local f
-    while IFS= read -r f; do
-        [ -n "$f" ] && RECORDS+=("$f")
-    done < <(find "$RELAY_DIR" -maxdepth 1 -type f -name '*.env' 2>/dev/null \
-        | awk -F/ '{n=$NF; sub(/\.env$/,"",n); if (n ~ /^[0-9]+$/) print n "\t" $0}' | sort -n | cut -f2-)
-    return 0
-}
-
-load_record() {
-    R_IDX=""; R_UUID=""; R_PORT=""; R_NAME=""; R_SERVER=""; R_SERVER_PORT=""
-    R_METHOD=""; R_PASSWORD=""; R_IN_TAG=""; R_OUT_TAG=""
-    # shellcheck disable=SC1090
-    . "$1"
-}
-
-save_record() {
-    mkdir -p "$RELAY_DIR"
-    chmod 700 "$RELAY_DIR" 2>/dev/null || true
-    {
-        printf 'R_IDX=%q\n' "$R_IDX"
-        printf 'R_UUID=%q\n' "$R_UUID"
-        printf 'R_PORT=%q\n' "$R_PORT"
-        printf 'R_NAME=%q\n' "$R_NAME"
-        printf 'R_SERVER=%q\n' "$R_SERVER"
-        printf 'R_SERVER_PORT=%q\n' "$R_SERVER_PORT"
-        printf 'R_METHOD=%q\n' "$R_METHOD"
-        printf 'R_PASSWORD=%q\n' "$R_PASSWORD"
-        printf 'R_IN_TAG=%q\n' "$R_IN_TAG"
-        printf 'R_OUT_TAG=%q\n' "$R_OUT_TAG"
-    } > "$RELAY_DIR/$R_IDX.env"
-    chmod 600 "$RELAY_DIR/$R_IDX.env"
-}
-
-# 公共参数写入 relay.env；UUID/LISTEN_PORT/NODE_NAME 保留第一个中转节点的值，兼容旧版脚本
-save_env() {
-    mkdir -p "$SB_DIR"
-    list_records
-    local c_uuid="" c_port="" c_name=""
-    if [ "${#RECORDS[@]}" -gt 0 ]; then
-        c_uuid=$(load_record "${RECORDS[0]}"; printf '%s' "$R_UUID")
-        c_port=$(load_record "${RECORDS[0]}"; printf '%s' "$R_PORT")
-        c_name=$(load_record "${RECORDS[0]}"; printf '%s' "$R_NAME")
-    fi
-    {
-        printf 'UUID=%q\n' "$c_uuid"
-        printf 'PUB_IP=%q\n' "$PUB_IP"
-        printf 'LISTEN_PORT=%q\n' "$c_port"
-        printf 'REALITY_PUB=%q\n' "$REALITY_PUB"
-        printf 'REALITY_SID=%q\n' "$REALITY_SID"
-        printf 'RELAY_SNI=%q\n' "$RELAY_SNI"
-        printf 'NODE_NAME=%q\n' "$c_name"
-        printf 'DIRECT_ENABLED=%q\n' "$DIRECT_ENABLED"
-        printf 'DIRECT_PORT=%q\n' "$DIRECT_PORT"
-        printf 'DIRECT_UUID=%q\n' "$DIRECT_UUID"
-        printf 'DIRECT_NAME=%q\n' "$DIRECT_NAME"
-        printf 'RELAY_FORMAT=%q\n' "2"
-    } > "$RELAY_ENV"
-    chmod 600 "$RELAY_ENV"
-}
-
-# 旧版（只有一个中转节点、没有 relays/ 目录）自动迁移为节点 1：端口/UUID/名称/链接都不变
-migrate_old() {
-    list_records
-    [ "${#RECORDS[@]}" -gt 0 ] && return 0
-    [ -n "${UUID:-}" ] && [ -n "${LISTEN_PORT:-}" ] || return 0
-    R_IDX=1
-    R_UUID="$UUID"
-    R_PORT="$LISTEN_PORT"
-    R_NAME="${NODE_NAME:-中转-$PUB_IP}"
-    R_IN_TAG="vless-in"
-    R_OUT_TAG="relay-out"
-    R_SERVER=""; R_SERVER_PORT=""; R_METHOD=""; R_PASSWORD=""
-    if [ -f "$CONFIG" ]; then
-        R_SERVER=$(jq -r '[(.outbounds // [])[] | select(.tag=="relay-out")][0].server // empty' "$CONFIG" 2>/dev/null || true)
-        R_SERVER_PORT=$(jq -r '[(.outbounds // [])[] | select(.tag=="relay-out")][0].server_port // empty' "$CONFIG" 2>/dev/null || true)
-        R_METHOD=$(jq -r '[(.outbounds // [])[] | select(.tag=="relay-out")][0].method // empty' "$CONFIG" 2>/dev/null || true)
-        R_PASSWORD=$(jq -r '[(.outbounds // [])[] | select(.tag=="relay-out")][0].password // empty' "$CONFIG" 2>/dev/null || true)
-    fi
-    save_record
-    list_records
-    info "已把旧版的中转节点登记为「节点 1」（端口 $R_PORT、UUID、链接都不变）"
-}
-
-load_env() {
-    if [ ! -f "$RELAY_ENV" ]; then
-        err "未找到 $RELAY_ENV，请先完成线路机安装"
-        return 1
-    fi
-    command -v jq >/dev/null 2>&1 || { err "需要 jq"; return 1; }
-    # shellcheck disable=SC1090
-    . "$RELAY_ENV"
-    set_pub_ip_uri
-    migrate_old
-}
-
-# 重新生成所有链接并整体重写 relay_uri.txt（不改动运行中的配置）
-build_links() {
-    set_pub_ip_uri
-    list_records
-    mkdir -p "$SB_DIR"
-    local f tmp="${RELAY_URI_FILE}.tmp"
-    : > "$tmp"
-    for f in ${RECORDS[@]+"${RECORDS[@]}"}; do
-        load_record "$f"
-        make_link "$R_UUID" "$R_PORT" "$R_NAME" >> "$tmp"
-    done
-    if [ "$DIRECT_ENABLED" = "true" ]; then
-        make_link "$DIRECT_UUID" "$DIRECT_PORT" "$DIRECT_NAME" >> "$tmp"
-    fi
-    mv "$tmp" "$RELAY_URI_FILE"
-}
-
-# 列出所有中转节点（编号从 1 开始，对应 RECORDS 下标+1）
-print_records() {
-    local i=0 f
-    for f in ${RECORDS[@]+"${RECORDS[@]}"}; do
-        i=$((i + 1))
-        load_record "$f"
-        echo "   $i) ${R_NAME}  | 线路机端口 ${R_PORT} → 落地机 ${R_SERVER:-未知}:${R_SERVER_PORT:-?}"
-    done
-}
-
-show_link() {
-    if [ -f "$RELAY_ENV" ] && command -v jq >/dev/null 2>&1; then
-        load_env
-        build_links
-        local i=0 f
-        for f in ${RECORDS[@]+"${RECORDS[@]}"}; do
-            i=$((i + 1))
-            load_record "$f"
-            echo "=============== 中转节点 $i (出口落地机 ${R_SERVER:-未知}:${R_SERVER_PORT:-?}) ==============="
-            echo "名称: $R_NAME    线路机端口: $R_PORT"
-            make_link "$R_UUID" "$R_PORT" "$R_NAME"
-        done
-        if [ "$DIRECT_ENABLED" = "true" ]; then
-            echo "=============== 直连节点(出口本机) ================="
-            echo "名称: $DIRECT_NAME    线路机端口: $DIRECT_PORT"
-            make_link "$DIRECT_UUID" "$DIRECT_PORT" "$DIRECT_NAME"
-        fi
-        echo "===================================================="
-        echo "所有链接也保存在: $RELAY_URI_FILE"
-    elif [ -f "$RELAY_URI_FILE" ]; then
-        echo "=============== 中转节点 Reality 链接 ==============="
-        cat "$RELAY_URI_FILE"
-        echo "===================================================="
-    else
-        err "未找到 $RELAY_URI_FILE"
-        return 1
-    fi
-}
-
-# 让用户从中转节点列表里选一个，结果放在 CHOSEN（记录文件路径）
-choose_record() {
-    local prompt="$1" n
-    CHOSEN=""
-    print_records
-    read -r -p "$prompt" n || return 1
-    if [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le "${#RECORDS[@]}" ]; then
-        CHOSEN="${RECORDS[$((n - 1))]}"
-        return 0
-    fi
-    err "无效选择: $n"
-    return 1
-}
-
-# 修改节点名称：只重新生成链接和 relay_uri.txt，不动 config.json / 服务
-rename_node() {
-    load_env || return 1
-    local which new_name f
-    echo "要修改哪个节点的名称?"
-    print_records
-    [ "$DIRECT_ENABLED" = "true" ] && echo "   d) 直连节点(出口本机): $DIRECT_NAME"
-    read -r -p "请输入编号(回车默认 1): " which || return 1
-    which="${which:-1}"
-    if [[ "$which" =~ ^[Dd]$ ]] && [ "$DIRECT_ENABLED" = "true" ]; then
-        read -r -p "请输入新的直连节点名称(回车保持「$DIRECT_NAME」): " new_name || true
-        DIRECT_NAME="${new_name:-$DIRECT_NAME}"
-        info "✅ 直连节点名称: $DIRECT_NAME（未改动运行中的配置）"
-    elif [[ "$which" =~ ^[0-9]+$ ]] && [ "$which" -ge 1 ] && [ "$which" -le "${#RECORDS[@]}" ]; then
-        f="${RECORDS[$((which - 1))]}"
-        load_record "$f"
-        read -r -p "请输入新的中转节点名称(回车保持「$R_NAME」): " new_name || true
-        R_NAME="${new_name:-$R_NAME}"
-        save_record
-        info "✅ 中转节点 $which 名称: $R_NAME（未改动运行中的配置）"
-    else
-        err "无效选择: $which"
-        return 1
-    fi
-    save_env
-    build_links
-    show_link
-}
-
-svc_restart() {
-    if command -v rc-service >/dev/null 2>&1; then
-        rc-service sing-box restart
-    else
-        systemctl restart sing-box
-    fi
-}
-
-check_config() {
-    if command -v sing-box >/dev/null 2>&1 && ! sing-box check -c "$CONFIG"; then
-        return 1
-    fi
-    return 0
-}
-
-backup_config() {
-    BAK="${CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
-    [ -e "$BAK" ] && BAK="${BAK}-$$-$RANDOM"
-    cp "$CONFIG" "$BAK"
-}
-
-# 校验新配置，通过则重启；失败则从备份还原并报错
-apply_or_restore() {
-    if ! check_config; then
-        err "新配置校验失败(sing-box check)，已从备份还原: $BAK，运行中的服务未改动"
-        cp "$BAK" "$CONFIG"
-        return 1
-    fi
-    info "配置校验通过（修改前已备份到: $BAK），正在重启 sing-box..."
-    svc_restart || warn "重启失败，请检查: sing-box check -c $CONFIG"
-    return 0
-}
-
-save_self_copy() {
-    # 保存一份脚本副本，方便以后管理: bash /etc/sing-box/relay-install.sh
-    if [ -f "$0" ] && [ "$(readlink -f "$0")" != "$SELF_COPY" ]; then
-        if cp "$0" "$SELF_COPY" 2>/dev/null; then chmod 700 "$SELF_COPY" || true; fi
-    fi
-}
-
-# 提醒放行端口；系统防火墙开着时询问是否自动放行
-firewall_reminder() {
-    local p ans
-    echo ""
-    warn "=================== ⚠️ 重要：放行端口 ==================="
-    warn "请在云厂商安全组放行端口(TCP): $*  ，否则节点连不上！"
-    echo "   Oracle 甲骨文云: 控制台 → 网络(Networking) → 虚拟云网络(Virtual Cloud Networks)"
-    echo "   → 点你的 VCN → 安全列表(Security Lists) → Default Security List → 添加入站规则(Add Ingress Rules)"
-    echo "   源 CIDR 填 0.0.0.0/0，IP 协议选 TCP，目标端口范围填上面的端口号 → 保存"
-    for p in "$@"; do
-        if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-            read -r -p "检测到系统防火墙 ufw 已开启，是否自动放行 ${p}/tcp?(Y/n): " ans || ans=n
-            [[ "$ans" =~ ^[Nn]$ ]] || ufw allow "${p}/tcp" || true
-        elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-            read -r -p "检测到系统防火墙 firewalld 已开启，是否自动放行 ${p}/tcp?(Y/n): " ans || ans=n
-            if [[ ! "$ans" =~ ^[Nn]$ ]]; then
-                if firewall-cmd --permanent --add-port="${p}/tcp"; then firewall-cmd --reload || true; fi
-            fi
-        elif command -v iptables >/dev/null 2>&1 && iptables -S INPUT 2>/dev/null | grep -q -- '-j REJECT' \
-            && ! iptables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null; then
-            read -r -p "检测到系统 iptables 有拦截规则(Oracle 的 Ubuntu 镜像默认如此)，是否自动放行 ${p}/tcp?(Y/n): " ans || ans=n
-            if [[ ! "$ans" =~ ^[Nn]$ ]]; then
-                iptables -I INPUT -p tcp --dport "$p" -j ACCEPT || true
-                if command -v netfilter-persistent >/dev/null 2>&1; then
-                    netfilter-persistent save >/dev/null 2>&1 || true
-                else
-                    warn "iptables 规则重启后可能失效；如需永久生效请安装 iptables-persistent"
-                fi
-            fi
-        fi
-    done
-    warn "========================================================"
-}
-
-# 本机现有的 Reality 设置（新节点复用同一套密钥/SNI/short_id，链接里的 pbk/sid 与 relay.env 一致）
-REALITY_TLS_JQ='([(.inbounds // [])[] | select(.type=="vless" and (.tls.reality.enabled // false))] | sort_by(if .tag=="vless-direct-in" then 1 else 0 end) | .[0].tls)'
-
-# 向 config.json 加入直连 inbound（复用中转节点的 Reality 密钥/SNI/short_id）和路由规则
-apply_direct_config() {
-    local tmp="${CONFIG}.tmp"
-    jq --argjson port "$DIRECT_PORT" --arg uuid "$DIRECT_UUID" "
-      $REALITY_TLS_JQ as \$tls
-      | if \$tls == null then error(\"本机配置里没有 Reality 入站\") else . end
-      | .inbounds = ([(.inbounds // [])[] | select(.tag != \"vless-direct-in\")] + [{
-          \"type\": \"vless\",
-          \"listen\": \"::\",
-          \"listen_port\": \$port,
-          \"users\": [{ \"uuid\": \$uuid, \"flow\": \"xtls-rprx-vision\" }],
-          \"tls\": \$tls,
-          \"tag\": \"vless-direct-in\"
-        }])
-      | .outbounds = ((.outbounds // []) | if any(.[]; .tag==\"direct-out\") then . else . + [{\"type\":\"direct\",\"tag\":\"direct-out\"}] end)
-      | .route.rules = ([(.route.rules // [])[] | select(.inbound != \"vless-direct-in\")] + [{ \"inbound\": \"vless-direct-in\", \"outbound\": \"direct-out\" }])
-    " "$CONFIG" > "$tmp" && mv "$tmp" "$CONFIG"
-}
-
-remove_direct_config() {
-    local tmp="${CONFIG}.tmp"
-    jq '
-      .inbounds = [(.inbounds // [])[] | select(.tag != "vless-direct-in")]
-      | .route.rules = [(.route.rules // [])[] | select(.inbound != "vless-direct-in")]
-    ' "$CONFIG" > "$tmp" && mv "$tmp" "$CONFIG"
-}
-
-# 询问直连节点端口/名称（结果写入 DIRECT_* 变量）：$1=需避开的端口 $2=strict
-ask_direct() {
-    ask_port "请输入直连节点监听端口(回车随机 20000-65000，不能与中转端口相同): " "${1:-}" "${2:-}" || return 1
-    DIRECT_PORT="$ASKED_PORT"
-    DIRECT_UUID=$(new_uuid)
-    local def="直连-$PUB_IP" n
-    read -r -p "请输入直连节点名称/备注(回车默认「$def」): " n || true
-    DIRECT_NAME="${n:-$def}"
-    DIRECT_ENABLED=true
-}
-
-# 已安装后：添加/删除直连节点（会修改 config.json 并重启服务，修改前自动备份）
-manage_direct() {
-    load_env || return 1
-    local ans
-    if [ "$DIRECT_ENABLED" = "true" ]; then
-        echo "当前已有直连节点(出口本机)，端口: $DIRECT_PORT，名称: $DIRECT_NAME"
-        read -r -p "是否删除该直连节点?(y/N): " ans || ans=n
-        [[ "$ans" =~ ^[Yy]$ ]] || { info "已取消"; return 0; }
-        backup_config
-        remove_direct_config
-        apply_or_restore || return 1
-        DIRECT_ENABLED=false; DIRECT_PORT=""; DIRECT_UUID=""; DIRECT_NAME=""
-    else
-        ask_direct "" strict || return 1
-        backup_config
-        if ! apply_direct_config; then
-            err "写入直连节点失败，已还原: $BAK"
-            cp "$BAK" "$CONFIG"
-            return 1
-        fi
-        apply_or_restore || return 1
-    fi
-    save_env
-    build_links
-    save_self_copy
-    show_link
-    if [ "$DIRECT_ENABLED" = "true" ]; then
-        firewall_reminder "$DIRECT_PORT"
-    fi
-    return 0
-}
-
-# 查找本脚本对应的落地机是否已添加过（同一 server + 端口），结果放在 DUP_FILE
-find_dup() {
-    DUP_FILE=""
-    landing_valid || return 1
-    local f s
-    s=$(lower "$LANDING_SERVER")
-    for f in ${RECORDS[@]+"${RECORDS[@]}"}; do
-        load_record "$f"
-        if [ "$(lower "$R_SERVER")" = "$s" ] && [ "$R_SERVER_PORT" = "$LANDING_PORT" ]; then
-            DUP_FILE="$f"
-            return 0
-        fi
-    done
-    return 1
-}
-
-need_tools() {
-    command -v jq >/dev/null 2>&1 || { err "未找到 jq，请先安装: apk add jq 或 apt-get install -y jq"; return 1; }
-    command -v sing-box >/dev/null 2>&1 || { err "未找到 sing-box，请选择「全部重新安装」"; return 1; }
-    [ -f "$CONFIG" ] || { err "未找到 $CONFIG，请选择「全部重新安装」"; return 1; }
-}
-
-# 已存在的落地机：用本脚本里的新 SS 密码/加密方式原地更新
-update_dup() {
-    load_record "$DUP_FILE"
-    local ans idx="$R_IDX" pos=0 i=0 f
-    for f in ${RECORDS[@]+"${RECORDS[@]}"}; do i=$((i + 1)); [ "$f" = "$DUP_FILE" ] && pos=$i; done
-    echo ""
-    warn "这台落地机 ${LANDING_SERVER}:${LANDING_PORT} 已经添加过了：中转节点 $pos「$R_NAME」(线路机端口 $R_PORT)，不会重复添加。"
-    if [ "$R_METHOD" = "$LANDING_METHOD" ] && [ "$R_PASSWORD" = "$LANDING_PASSWORD" ]; then
-        info "SS 加密方式和密码也都一样，无需修改。下面是现有链接："
-        show_link
-        return 0
-    fi
-    echo "   落地机的 SS 参数有变化: 加密方式 ${R_METHOD:-未知} → $LANDING_METHOD，密码也将更新为本次脚本里的值"
-    read -r -p "是否更新该节点的 SS 密码/加密方式?(链接不变，Y/n): " ans || ans=n
-    [[ "$ans" =~ ^[Nn]$ ]] && { info "已取消"; return 0; }
-    backup_config
-    if ! jq --arg t "$R_OUT_TAG" --arg m "$LANDING_METHOD" --arg p "$LANDING_PASSWORD" \
-        '.outbounds = [(.outbounds // [])[] | if .tag == $t then (.method = $m | .password = $p) else . end]' \
-        "$CONFIG" > "${CONFIG}.tmp"; then
-        rm -f "${CONFIG}.tmp"; err "修改失败，配置未改动"; return 1
-    fi
-    mv "${CONFIG}.tmp" "$CONFIG"
-    apply_or_restore || return 1
-    R_IDX="$idx"; R_METHOD="$LANDING_METHOD"; R_PASSWORD="$LANDING_PASSWORD"
-    save_record
-    save_self_copy
-    info "✅ 已更新中转节点 $pos 的 SS 参数，客户端链接不变，无需重新导入"
-    return 0
-}
-
-# 追加本脚本对应的落地机为新的中转节点（不动已有的入站/出站/直连节点）
-append_node() {
-    load_env || return 1
-    need_tools || return 1
-    if ! landing_valid; then
-        err "本脚本里没有有效的落地机参数（是线路机上保存的副本？）。请到【新落地机】上运行 sb → 生成线路机脚本，再把新脚本拿到本机运行。"
-        return 1
-    fi
-    list_records
-    if find_dup; then
-        update_dup
-        return $?
-    fi
-    if [ -z "$(jq -r "$REALITY_TLS_JQ | .reality.private_key // empty" "$CONFIG")" ]; then
-        err "$CONFIG 里没有 Reality 入站，无法追加。请选择「全部重新安装」"
-        return 1
-    fi
-
-    # 新编号 = 现有最大编号 + 1；tag 与配置里已有的不冲突
-    local max=0 f idx in_tag out_tag def name ans
-    for f in ${RECORDS[@]+"${RECORDS[@]}"}; do
-        load_record "$f"
-        [[ "$R_IDX" =~ ^[0-9]+$ ]] && [ "$R_IDX" -gt "$max" ] && max="$R_IDX"
-    done
-    idx=$((max + 1))
-    while true; do
-        if [ "$idx" -eq 1 ]; then in_tag="vless-in"; out_tag="relay-out"; else in_tag="vless-in-$idx"; out_tag="relay-out-$idx"; fi
-        if [ ! -f "$RELAY_DIR/$idx.env" ] && ! jq -e --arg a "$in_tag" --arg b "$out_tag" \
-            'any((.inbounds // [])[]; .tag == $a) or any((.outbounds // [])[]; .tag == $b)' "$CONFIG" >/dev/null; then
-            break
-        fi
-        idx=$((idx + 1))
-    done
-
-    echo ""
-    info "=== 追加新的中转节点：线路机 → 落地机 ${LANDING_SERVER}:${LANDING_PORT} ==="
-    echo "   已有节点不受影响（端口/UUID/链接都不变）。"
-    ask_port "请输入新中转节点的监听端口(回车随机 20000-65000，不能和已有节点相同): " "" strict || return 1
-    R_PORT="$ASKED_PORT"
-    def="中转-落地${LANDING_SERVER}"
-    read -r -p "请输入新中转节点名称/备注(回车默认「$def」): " name || true
-    R_NAME="${name:-$def}"
-    R_IDX="$idx"
-    R_UUID=$(new_uuid)
-    R_SERVER="$LANDING_SERVER"
-    R_SERVER_PORT="$LANDING_PORT"
-    R_METHOD="$LANDING_METHOD"
-    R_PASSWORD="$LANDING_PASSWORD"
-    R_IN_TAG="$in_tag"
-    R_OUT_TAG="$out_tag"
-
-    echo ""
-    echo "   新节点: 名称「$R_NAME」，线路机端口 $R_PORT，落地机 ${R_SERVER}:${R_SERVER_PORT} ($R_METHOD)"
-    read -r -p "确认追加?(Y/n): " ans || ans=n
-    [[ "$ans" =~ ^[Nn]$ ]] && { info "已取消"; return 0; }
-
-    backup_config
-    if ! jq --argjson port "$R_PORT" --arg uuid "$R_UUID" --arg itag "$R_IN_TAG" --arg otag "$R_OUT_TAG" \
-        --arg server "$R_SERVER" --argjson sport "$R_SERVER_PORT" --arg method "$R_METHOD" --arg pw "$R_PASSWORD" "
-      $REALITY_TLS_JQ as \$tls
-      | .inbounds = ((.inbounds // []) + [{
-          \"type\": \"vless\",
-          \"listen\": \"::\",
-          \"listen_port\": \$port,
-          \"users\": [{ \"uuid\": \$uuid, \"flow\": \"xtls-rprx-vision\" }],
-          \"tls\": \$tls,
-          \"tag\": \$itag
-        }])
-      | .outbounds = ((.outbounds // []) + [{
-          \"type\": \"shadowsocks\",
-          \"server\": \$server,
-          \"server_port\": \$sport,
-          \"method\": \$method,
-          \"password\": \$pw,
-          \"tag\": \$otag
-        }])
-      | .route.rules = ((.route.rules // []) + [{ \"inbound\": \$itag, \"outbound\": \$otag }])
-    " "$CONFIG" > "${CONFIG}.tmp"; then
-        rm -f "${CONFIG}.tmp"
-        err "生成新配置失败，配置未改动"
-        return 1
-    fi
-    mv "${CONFIG}.tmp" "$CONFIG"
-    apply_or_restore || return 1
-
-    save_record
-    save_env
-    build_links
-    save_self_copy
-    echo ""
-    info "✅ 已追加中转节点「$R_NAME」（线路机端口 $R_PORT → 落地机 ${R_SERVER}:${R_SERVER_PORT}）"
-    show_link
-    echo ""
-    info "👉 新节点的链接是上面「名称: $R_NAME」下面那一行，复制到小火箭(Shadowrocket)导入即可；旧节点不用动。"
-    firewall_reminder "$R_PORT"
-    return 0
-}
-
-# 删除某个中转节点（至少保留一个）
-delete_node() {
-    load_env || return 1
-    need_tools || return 1
-    local ans pos del_port
-    if [ "${#RECORDS[@]}" -le 1 ]; then
-        err "本机只有 1 个中转节点，不能删除最后一个。如需全部重来，请选择「全部重新安装」。"
-        return 1
-    fi
-    echo "要删除哪个中转节点?"
-    choose_record "请输入编号(其他键取消): " || { info "已取消"; return 0; }
-    load_record "$CHOSEN"
-    pos="$R_NAME"
-    del_port="$R_PORT"
-    warn "将删除中转节点「$pos」(线路机端口 $R_PORT → 落地机 ${R_SERVER:-未知}:${R_SERVER_PORT:-?})，它的链接会失效。"
-    read -r -p "确认删除?(y/N): " ans || ans=n
-    [[ "$ans" =~ ^[Yy]$ ]] || { info "已取消"; return 0; }
-    backup_config
-    if ! jq --arg itag "$R_IN_TAG" --arg otag "$R_OUT_TAG" '
-      .inbounds = [(.inbounds // [])[] | select(.tag != $itag)]
-      | .outbounds = [(.outbounds // [])[] | select(.tag != $otag)]
-      | .route.rules = [(.route.rules // [])[] | select(.inbound != $itag and .outbound != $otag)]
-    ' "$CONFIG" > "${CONFIG}.tmp"; then
-        rm -f "${CONFIG}.tmp"; err "修改失败，配置未改动"; return 1
-    fi
-    mv "${CONFIG}.tmp" "$CONFIG"
-    apply_or_restore || return 1
-    rm -f "$CHOSEN"
-    save_env
-    build_links
-    save_self_copy
-    info "✅ 已删除中转节点「$pos」。可以顺手到 Oracle 安全列表里删掉端口 $del_port 的放行规则（可选）。"
-    show_link
-}
-
-# 「全部重新安装」前的确认
-confirm_overwrite() {
-    local ans
-    echo ""
-    warn "⚠️ 全部重新安装：会删除本机【所有】中转节点和直连节点，只为本次这台落地机(${LANDING_SERVER}:${LANDING_PORT})新建 1 个节点！"
-    warn "   所有旧链接都会失效，需要重新导入。旧配置会自动备份(config.json.bak.时间戳)。"
-    warn "   如果只是想再加一台落地机，请不要选这个，而是选「追加」。"
-    read -r -p "确定要全部重新安装吗? 请输入 yes 确认(其他任意键取消): " ans || ans=""
-    [ "$ans" = "yes" ]
-}
-
-# ===== 入口：参数 / 已安装时的菜单 =====
-MODE="${1:-}"
-case "$MODE" in
-    rename) rename_node; exit $? ;;
-    show|link) show_link; exit $? ;;
-    direct) manage_direct; exit $? ;;
-    append|add) append_node; exit $? ;;
-    delete|del|remove) delete_node; exit $? ;;
-    install|"") ;;
-    *) err "未知参数: $MODE（可用: append | show | rename | delete | direct | install）"; exit 1 ;;
-esac
-
-if [ -f "$RELAY_ENV" ]; then
-    if [ "$MODE" = "install" ]; then
-        confirm_overwrite || { info "已取消"; exit 0; }
-    else
-        load_env || exit 1
-        echo ""
-        echo "==================== 线路机管理 ===================="
-        echo "本机已经是线路机，现有 ${#RECORDS[@]} 个中转节点:"
-        print_records
-        [ "$DIRECT_ENABLED" = "true" ] && echo "   另有直连节点(出口本机): $DIRECT_NAME | 端口 $DIRECT_PORT"
-        if landing_valid; then
-            echo "本次脚本对应的落地机: ${LANDING_SERVER}:${LANDING_PORT}"
-            echo "----------------------------------------------------"
-            if find_dup; then
-                echo "1) 这台落地机已添加过 → 检查/更新它的 SS 密码(不会重复添加)"
-            else
-                echo "1) 追加这台落地机为新的中转节点（推荐，已有节点不受影响）"
-            fi
-        else
-            echo "----------------------------------------------------"
-            echo "1) 追加新的落地机（需用新落地机 sb 生成的脚本，本副本无落地机参数）"
-        fi
-        echo "2) 查看所有节点链接"
-        echo "3) 修改节点名称"
-        echo "4) 删除某个中转节点"
-        echo "5) 添加/删除直连节点(出口本机)"
-        echo "9) ⚠️ 全部重新安装（删除所有已有节点，旧链接全部失效）"
-        echo "0) 退出"
-        echo "===================================================="
-        read -r -p "请选择(直接回车 = 1): " choice || choice=0
-        case "${choice:-1}" in
-            1) append_node; exit $? ;;
-            2) show_link; exit $? ;;
-            3) rename_node; exit $? ;;
-            4) delete_node; exit $? ;;
-            5) manage_direct; exit $? ;;
-            9) confirm_overwrite || { info "已取消"; exit 0; } ;;
-            *) exit 0 ;;
-        esac
-    fi
-fi
-
-# ===== 全新安装 / 全部重新安装 =====
-if ! landing_valid; then
-    err "本脚本里没有有效的落地机参数。请在落地机上运行 sb → 生成线路机脚本。"
-    exit 1
-fi
-DIRECT_ENABLED=false; DIRECT_PORT=""; DIRECT_UUID=""; DIRECT_NAME=""
-
-detect_os(){
-    . /etc/os-release 2>/dev/null || true
-    case "${ID:-}" in
-        alpine) OS=alpine ;;
-        debian|ubuntu) OS=debian ;;
-        centos|rhel|fedora) OS=redhat ;;
-        *) OS=unknown ;;
-    esac
-}
-detect_os
-
-info "安装依赖..."
-case "$OS" in
-    alpine) apk update; apk add --no-cache curl jq bash openssl ca-certificates ;;
-    debian) apt-get update -y; apt-get install -y curl jq bash openssl ca-certificates ;;
-    redhat) yum install -y curl jq bash openssl ca-certificates ;;
-esac
-
-info "安装 sing-box..."
-case "$OS" in
-    alpine) apk add --repository=http://dl-cdn.alpinelinux.org/alpine/edge/community sing-box ;;
-    *) bash <(curl -fsSL https://sing-box.app/install.sh) ;;
-esac
-
-UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "00000000-0000-0000-0000-000000000000")
-
-info "生成 Reality 密钥对"
-REALITY_KEYS=$(sing-box generate reality-keypair 2>/dev/null || echo "")
-REALITY_PK=$(echo "$REALITY_KEYS" | grep "PrivateKey" | awk '{print $NF}' | tr -d '\r' || echo "")
-REALITY_PUB=$(echo "$REALITY_KEYS" | grep "PublicKey" | awk '{print $NF}' | tr -d '\r' || echo "")
-REALITY_SID=$(sing-box generate rand 8 --hex 2>/dev/null || echo "0123456789abcdef")
-if [ -z "$REALITY_PK" ] || [ -z "$REALITY_PUB" ]; then
-    err "生成 Reality 密钥失败，请检查 sing-box 是否安装成功"
-    exit 1
-fi
-
-ask_port "请输入线路机(中转节点)监听端口(留空随机 20000-65000): " ""
-LISTEN_PORT="$ASKED_PORT"
-
-PUB_IP=""
-for ip_url in https://api.ipify.org https://api64.ipify.org https://icanhazip.com; do
-    PUB_IP=$(curl -s --max-time 5 "$ip_url" 2>/dev/null | tr -d '[:space:]' || true)
-    # 只接受像 IP 的结果（防止把错误页面写进链接）
-    if [[ "$PUB_IP" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || [[ "$PUB_IP" =~ ^[0-9A-Fa-f:]+$ && "$PUB_IP" == *:*:* ]]; then
-        break
-    fi
-    PUB_IP=""
-done
-[ -z "$PUB_IP" ] && PUB_IP="YOUR_RELAY_IP"
-set_pub_ip_uri
-
-DEFAULT_NAME="中转-落地${LANDING_SERVER}"
-read -r -p "请输入中转节点名称/备注(显示在链接 # 后，回车默认「$DEFAULT_NAME」): " NODE_NAME || true
-NODE_NAME="${NODE_NAME:-$DEFAULT_NAME}"
-
-echo ""
-read -r -p "是否同时添加一个本机(线路机)直连出口的 VLESS Reality 节点? (y/N): " ADD_DIRECT || ADD_DIRECT=n
-if [[ "$ADD_DIRECT" =~ ^[Yy]$ ]]; then
-    ask_direct "$LISTEN_PORT"
-fi
-
-mkdir -p "$SB_DIR"
-
-BAK=""
-if [ -f "$CONFIG" ]; then
-    BAK="${CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
-    warn "将覆盖已有的 $CONFIG，旧配置已备份到: $BAK"
-    cp "$CONFIG" "$BAK"
-fi
-
-# 用 jq 生成配置，避免密码中的特殊字符破坏 JSON
-jq -n \
-  --argjson listen_port "$LISTEN_PORT" \
-  --arg uuid "$UUID" \
-  --arg sni "$RELAY_SNI" \
-  --arg pk "$REALITY_PK" \
-  --arg sid "$REALITY_SID" \
-  --arg server "$LANDING_SERVER" \
-  --argjson server_port "$LANDING_PORT" \
-  --arg method "$LANDING_METHOD" \
-  --arg password "$LANDING_PASSWORD" '
-{
-  "log": { "level": "info", "timestamp": true },
-  "inbounds": [
-    {
-      "type": "vless",
-      "listen": "::",
-      "listen_port": $listen_port,
-      "users": [{ "uuid": $uuid, "flow": "xtls-rprx-vision" }],
-      "tls": {
-        "enabled": true,
-        "server_name": $sni,
-        "reality": {
-          "enabled": true,
-          "handshake": { "server": $sni, "server_port": 443 },
-          "private_key": $pk,
-          "short_id": [$sid]
-        }
-      },
-      "tag": "vless-in"
-    }
-  ],
-  "outbounds": [
-    {
-      "type": "shadowsocks",
-      "server": $server,
-      "server_port": $server_port,
-      "method": $method,
-      "password": $password,
-      "tag": "relay-out"
-    },
-    { "type": "direct", "tag": "direct-out" }
-  ],
-  "route": { "rules": [{ "inbound": "vless-in", "outbound": "relay-out" }] }
-}' > "$CONFIG"
-
-if [ "$DIRECT_ENABLED" = "true" ]; then
-    apply_direct_config
-fi
-
-if ! check_config; then
-    if [ -n "$BAK" ]; then
-        cp "$BAK" "$CONFIG"
-        err "sing-box 配置校验未通过，已还原旧配置: $BAK（未重启服务）"
-    else
-        err "sing-box 配置校验未通过，请检查: sing-box check -c $CONFIG"
-    fi
-    exit 1
-fi
-
-if [ "$OS" = "alpine" ]; then
-    cat > /etc/init.d/sing-box <<'SVC'
-#!/sbin/openrc-run
-name="sing-box"
-command="/usr/bin/sing-box"
-command_args="run -c /etc/sing-box/config.json"
-command_background="yes"
-pidfile="/run/sing-box.pid"
-supervisor=supervise-daemon
-supervise_daemon_args="--respawn-max 0 --respawn-delay 5"
-
-depend() { need net; }
-SVC
-    chmod +x /etc/init.d/sing-box
-    rc-update add sing-box default
-    rc-service sing-box restart
-else
-    cat > /etc/systemd/system/sing-box.service <<'SYSTEMD'
-[Unit]
-Description=Sing-box Relay
-After=network.target
-[Service]
-ExecStart=/usr/bin/sing-box run -c /etc/sing-box/config.json
-Restart=on-failure
-RestartSec=10s
-[Install]
-WantedBy=multi-user.target
-SYSTEMD
-    systemctl daemon-reload
-    systemctl enable sing-box
-    systemctl restart sing-box
-fi
-
-# 保存参数并生成链接：旧的节点记录(如果有)挪到备份目录，新建节点 1
-if [ -d "$RELAY_DIR" ]; then
-    mv "$RELAY_DIR" "${RELAY_DIR}.bak.$(date +%Y%m%d%H%M%S)"
-fi
-R_IDX=1; R_UUID="$UUID"; R_PORT="$LISTEN_PORT"; R_NAME="$NODE_NAME"
-R_SERVER="$LANDING_SERVER"; R_SERVER_PORT="$LANDING_PORT"; R_METHOD="$LANDING_METHOD"; R_PASSWORD="$LANDING_PASSWORD"
-R_IN_TAG="vless-in"; R_OUT_TAG="relay-out"
-save_record
-save_env
-build_links
-save_self_copy
-
-echo ""
-info "✅ 安装完成"
-show_link
-echo ""
-info "💡 链接已保存到: $RELAY_URI_FILE"
-info "💡 以后管理(查看/改名/删除/直连节点): bash $SELF_COPY"
-info "💡 再加一台落地机: 在新落地机上 sb → 生成线路机脚本，把新脚本拿到本机运行，选「1) 追加」"
-if [ "$DIRECT_ENABLED" = "true" ]; then
-    firewall_reminder "$LISTEN_PORT" "$DIRECT_PORT"
-else
-    firewall_reminder "$LISTEN_PORT"
-fi
-RELAY_EOF
+    write_relay_template "$RELAY_SCRIPT"
 
     # 替换占位符（INBOUND_IP/PORT/METHOD/PASSWORD 同时替换 REALITY_SNI）
     # 值放在单引号里，并转义 sed 特殊字符，避免密码含 / & | ' 等字符时出错
@@ -3410,11 +4028,13 @@ RELAY_EOF
     echo "   【线路机上已经有别的落地机的中转节点】会出现菜单，直接回车选「1) 追加这台落地机为新的中转节点」，"
     echo "   原有节点的端口/链接都不变。不要选「9) 全部重新安装」，那会删掉所有已有节点！"
     echo "   (每多一台落地机，就在那台落地机上生成一次脚本，再到线路机上运行一次、选「追加」)"
-    echo "4. 完成后会显示 vless:// 链接（所有节点链接都保存在线路机 /etc/sing-box/relay_uri.txt）："
+    echo "4. 完成后会显示 vless:// 链接（所有节点链接都保存在线路机 /etc/sing-box-relay/relay_uri.txt）："
     echo "   把新节点那一行复制到 Shadowrocket(小火箭) 添加节点即可，不需要设置「代理通过」。"
     echo "5. 在线路机的云厂商安全组/防火墙(如 Oracle 的 Security List)放行新节点的监听端口(TCP)；若添加了直连节点，它的端口也要放行。"
     echo ""
-    info "之后在线路机运行 bash /etc/sing-box/relay-install.sh 可管理：查看链接 / 改名 / 删除节点 / 直连节点"
+    info "之后在线路机输入 sb（或 bash /etc/sing-box-relay/relay-install.sh）可管理：查看链接 / 改名 / 删除节点 / 直连节点"
+    echo "   线路机节点使用独立服务 sing-box-relay（配置 /etc/sing-box-relay），线路机上也可以再装落地机节点，互不覆盖。"
+    echo "   线路机如果是旧版(节点在 /etc/sing-box)，运行新脚本时会自动迁移，端口/UUID/链接都不变。"
     echo "=========================================================="
     echo ""
 
