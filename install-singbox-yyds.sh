@@ -156,6 +156,42 @@ install_deps() {
 install_deps
 
 # -----------------------
+# 旧版线路机（线路机节点放在 /etc/sing-box，和落地机共用 sing-box 服务）：
+# 先把线路机节点迁移到独立目录 /etc/sing-box-relay + 独立服务 sing-box-relay（端口/UUID/密钥/链接不变），
+# 再安装落地机节点，二者互不覆盖。迁移失败则中止安装，绝不覆盖线路机节点。
+MAIN_URL="https://raw.githubusercontent.com/demonmanch/singbox-deploy/main/install-singbox-yyds.sh"
+migrate_old_relay_if_needed() {
+    [ -f /etc/sing-box/relay.env ] && [ ! -f /etc/sing-box-relay/relay.env ] || return 0
+    warn "检测到本机是旧版线路机（线路机节点在 /etc/sing-box），安装落地机节点前先把它迁移到独立服务 sing-box-relay"
+    local src="" tmp rc=0
+    tmp=$(mktemp /tmp/relay-install.XXXXXX)
+    if [ -f "$0" ] && grep -q '^RELAY_EOF$' "$0" 2>/dev/null; then
+        src="$0"
+    elif curl -fsSL "$MAIN_URL" -o "${tmp}.main"; then
+        src="${tmp}.main"
+    fi
+    if [ -n "$src" ]; then
+        awk '/<<.RELAY_EOF.$/{f=1;next} /^RELAY_EOF$/{f=0} f' "$src" > "$tmp"
+    fi
+    if [ -s "$tmp" ] && grep -q 'SVC_NAME="sing-box-relay"' "$tmp" && bash -n "$tmp"; then
+        bash "$tmp" upgrade < /dev/null || rc=$?
+    else
+        err "无法获取新版线路机脚本（下载失败: $MAIN_URL）"
+        rc=1
+    fi
+    rm -f "$tmp" "${tmp}.main"
+    if [ "$rc" -ne 0 ] || [ ! -f /etc/sing-box-relay/relay.env ]; then
+        if [ ! -f /etc/sing-box/relay.env ]; then
+            return 0   # 只是过期的线路机记录，已挪到备份目录
+        fi
+        err "线路机节点迁移失败，为避免覆盖线路机节点，已中止安装（本机没有任何改动）"
+        exit 1
+    fi
+    info "✅ 线路机节点已迁移到 sing-box-relay，继续安装落地机节点"
+}
+migrate_old_relay_if_needed
+
+# -----------------------
 # ---- 公网 IP / NAT / WARP 检测（安装脚本与 sb 面板共用同一套逻辑）----
 is_ipv4() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
 is_ipv6() { [[ "$1" =~ ^[0-9A-Fa-f:.]+$ ]] && [[ "$1" == *:*:* ]]; }
@@ -583,6 +619,17 @@ port_in_use() {
 # 所以 Reality/AnyTLS 可以和 HY2/TUIC 使用同一个端口号
 declare -A USED_TCP=() USED_UDP=()
 NAT_RANGES=()
+
+# 本机线路机节点(sing-box-relay)已占用的端口：落地机节点不能再用
+if [ -f /etc/sing-box-relay/config.json ] && command -v jq >/dev/null 2>&1; then
+    for _rp in $(jq -r '(.inbounds // [])[].listen_port // empty' /etc/sing-box-relay/config.json 2>/dev/null || true); do
+        if validate_port "$_rp"; then
+            USED_TCP[$_rp]="本机线路机节点(sing-box-relay)"
+            USED_UDP[$_rp]="本机线路机节点(sing-box-relay)"
+        fi
+    done
+    unset _rp
+fi
 NAT_PORT_RANGE=""
 
 # 解析商家端口范围，例如 "56566-56586" 或 "20001,20002 20005" 或混合；结果放 NAT_RANGES("低 高")
@@ -676,7 +723,7 @@ ask_proto_port() {
             fi
             p=$((10#$p))
             if conflict=$(port_conflict "$p" "$nets"); then
-                err "端口 $p 已被本次的 ${conflict} 使用，请换一个"
+                err "端口 $p 已被 ${conflict} 使用，请换一个"
                 continue
             fi
             if [ "${#NAT_RANGES[@]}" -gt 0 ] && ! port_in_ranges "$p"; then
@@ -1588,6 +1635,9 @@ err()  { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
 CONFIG_PATH="/etc/sing-box/config.json"
 CACHE_FILE="/etc/sing-box/.config_cache"
 SERVICE_NAME="sing-box"
+# 本机的线路机(中转/直连)节点：独立目录 + 独立服务 sing-box-relay，与上面的落地机节点互不覆盖
+RELAY_HOME="/etc/sing-box-relay"
+RELAY_SELF="$RELAY_HOME/relay-install.sh"
 
 # 检测系统
 detect_os() {
@@ -2052,6 +2102,24 @@ action_edit_config() {
     fi
 }
 
+# 端口是否已被本机线路机节点(sing-box-relay)使用
+relay_port_taken() {
+    [ -f "$RELAY_HOME/config.json" ] && jq -e --argjson p "$1" 'any((.inbounds // [])[]; .listen_port == $p)' "$RELAY_HOME/config.json" >/dev/null 2>&1
+}
+
+# 新端口校验：数字 1-65535，且不能和本机线路机节点冲突
+check_new_port() {
+    if ! validate_port "$1"; then
+        err "端口无效: $1（需为 1-65535 的数字）"
+        return 1
+    fi
+    if relay_port_taken "$1"; then
+        err "端口 $1 已被本机的线路机节点(sing-box-relay，$RELAY_HOME/config.json)使用，请换一个"
+        return 1
+    fi
+    return 0
+}
+
 # 重置SS端口
 action_reset_ss() {
     read_config || return 1
@@ -2063,6 +2131,7 @@ action_reset_ss() {
     
     read -p "输入新的 SS 端口(回车保持 $SS_PORT): " new_port
     new_port="${new_port:-$SS_PORT}"
+    if [ "$new_port" != "${SS_PORT:-}" ]; then check_new_port "$new_port" || return 1; fi
     
     info "正在停止服务..."
     service_stop || warn "停止服务失败"
@@ -2090,6 +2159,7 @@ action_reset_hy2() {
     
     read -p "输入新的 HY2 端口(回车保持 $HY2_PORT): " new_port
     new_port="${new_port:-$HY2_PORT}"
+    if [ "$new_port" != "${HY2_PORT:-}" ]; then check_new_port "$new_port" || return 1; fi
     
     info "正在停止服务..."
     service_stop || warn "停止服务失败"
@@ -2117,6 +2187,7 @@ action_reset_tuic() {
     
     read -p "输入新的 TUIC 端口(回车保持 $TUIC_PORT): " new_port
     new_port="${new_port:-$TUIC_PORT}"
+    if [ "$new_port" != "${TUIC_PORT:-}" ]; then check_new_port "$new_port" || return 1; fi
     
     info "正在停止服务..."
     service_stop || warn "停止服务失败"
@@ -2144,6 +2215,7 @@ action_reset_reality() {
     
     read -p "输入新的 Vless Reality 端口(回车保持 $REALITY_PORT): " new_port
     new_port="${new_port:-$REALITY_PORT}"
+    if [ "$new_port" != "${REALITY_PORT:-}" ]; then check_new_port "$new_port" || return 1; fi
     
     info "正在停止服务..."
     service_stop || warn "停止服务失败"
@@ -2171,6 +2243,7 @@ action_reset_anytls() {
 
     read -p "输入新的 AnyTLS Reality 端口(回车保持 $ANYTLS_PORT): " new_port
     new_port="${new_port:-$ANYTLS_PORT}"
+    if [ "$new_port" != "${ANYTLS_PORT:-}" ]; then check_new_port "$new_port" || return 1; fi
 
     info "正在停止服务..."
     service_stop || warn "停止服务失败"
@@ -2212,26 +2285,105 @@ action_update() {
     fi
 }
 
-# 卸载
+# 卸载（只卸载落地机节点；本机的线路机节点 sing-box-relay 会询问是否一起卸载）
 action_uninstall() {
-    read -p "确认卸载 sing-box?(y/N): " confirm
+    read -p "确认卸载落地机节点(sing-box 服务 + /etc/sing-box)?(y/N): " confirm
     [[ ! "$confirm" =~ ^[Yy]$ ]] && info "已取消" && return 0
-    
+
+    local keep_relay=false ans
+    if old_relay_layout; then
+        relay_prepare || { err "迁移旧版线路机节点失败，为避免误删，已取消卸载"; return 1; }
+    fi
+    if relay_installed; then
+        warn "本机还有线路机(中转/直连)节点: 服务 sing-box-relay，目录 $RELAY_HOME"
+        read -r -p "是否同时卸载线路机节点?(y/N，默认保留): " ans || ans=n
+        if [[ "$ans" =~ ^[Yy]$ ]]; then
+            if [ -f "$RELAY_SELF" ]; then
+                printf 'y\n' | bash "$RELAY_SELF" uninstall || warn "卸载线路机节点失败"
+            fi
+        else
+            keep_relay=true
+        fi
+    fi
+
     info "正在卸载..."
     service_stop || true
     if [ "$OS" = "alpine" ]; then
         rc-update del sing-box default 2>/dev/null || true
         rm -f /etc/init.d/sing-box
-        apk del sing-box 2>/dev/null || true
+        $keep_relay || apk del sing-box 2>/dev/null || true
     else
         systemctl stop sing-box 2>/dev/null || true
         systemctl disable sing-box 2>/dev/null || true
         rm -f /etc/systemd/system/sing-box.service
         systemctl daemon-reload 2>/dev/null || true
-        apt purge -y sing-box >/dev/null 2>&1 || true
+        $keep_relay || apt purge -y sing-box >/dev/null 2>&1 || true
     fi
-    rm -rf /etc/sing-box /var/log/sing-box* /usr/local/bin/sb /usr/bin/sing-box /root/node_names.txt 2>/dev/null || true
+    rm -rf /etc/sing-box /var/log/sing-box.log /var/log/sing-box.err /usr/local/bin/sb /root/node_names.txt 2>/dev/null || true
+    if $keep_relay; then
+        info "已保留线路机节点和 sing-box 程序；sb 已换成线路机快捷菜单"
+        bash "$RELAY_SELF" shortcut >/dev/null 2>&1 || true
+    else
+        rm -f /usr/bin/sing-box 2>/dev/null || true
+        if [ -L /usr/bin/sb ] && [ ! -e /usr/bin/sb ]; then rm -f /usr/bin/sb; fi
+    fi
     info "卸载完成"
+}
+
+# 本机线路机节点是否已安装（新布局或旧布局）
+relay_installed() { [ -f "$RELAY_HOME/relay.env" ] || [ -f /etc/sing-box/relay.env ]; }
+old_relay_layout() { [ -f /etc/sing-box/relay.env ] && [ ! -f "$RELAY_HOME/relay.env" ]; }
+
+# 用本面板自带的线路机脚本模板运行一个命令（模板没有落地机参数）
+run_relay_template() {
+    local tmp rc=0
+    tmp=$(mktemp /tmp/relay-install.XXXXXX)
+    write_relay_template "$tmp"
+    chmod 700 "$tmp"
+    bash "$tmp" "$@" || rc=$?
+    rm -f "$tmp"
+    return "$rc"
+}
+
+# 旧版线路机布局(节点在 /etc/sing-box)先迁移到 sing-box-relay；本机线路机脚本副本太旧时换成新版
+relay_prepare() {
+    if old_relay_layout; then
+        info "检测到旧版线路机节点(在 /etc/sing-box，和落地机共用 sing-box 服务)，先迁移到独立服务 sing-box-relay（端口/UUID/链接不变）"
+        run_relay_template upgrade || return 1
+    fi
+    if [ -f "$RELAY_HOME/relay.env" ] && { [ ! -f "$RELAY_SELF" ] || ! grep -q 'SVC_NAME="sing-box-relay"' "$RELAY_SELF" 2>/dev/null; }; then
+        mkdir -p "$RELAY_HOME"
+        write_relay_template "$RELAY_SELF"
+        chmod 700 "$RELAY_SELF"
+    fi
+    return 0
+}
+
+# 线路机/直连节点管理（本机）
+action_relay_local() {
+    relay_prepare || return 1
+    if [ -f "$RELAY_HOME/relay.env" ]; then
+        bash "$RELAY_SELF" menu || true
+        return 0
+    fi
+    local c
+    echo ""
+    echo "========== 本机线路机/直连节点 =========="
+    echo "本机还没有线路机节点。它们使用独立服务 sing-box-relay（目录 $RELAY_HOME），不会改动本机的落地机节点。"
+    echo "1) 在本机添加一个直连节点(VLESS Reality，出口为本机)"
+    echo "2) 让本机作为线路机，中转另一台落地机（查看做法）"
+    echo "0) 返回"
+    echo "========================================"
+    read -r -p "请选择: " c || c=0
+    case "$c" in
+        1) run_relay_template direct || true ;;
+        2)
+            echo ""
+            echo "做法：在【另一台落地机】上输入 sb → 选「生成线路机脚本」，按提示把生成的整行命令复制到【本机】执行，"
+            echo "      选「追加」即可。本机的落地机节点和线路机节点各用各的服务，互不覆盖。"
+            ;;
+        *) ;;
+    esac
 }
 
 # 线路机脚本模板（落地机参数占位符未替换）：$1=写入路径
@@ -4126,13 +4278,26 @@ MENU
     option=$((option + 1))
     
     MENU_MAP[$option]="uninstall"
-    echo "$((option))) 卸载 sing-box"
+    echo "$((option))) 卸载 sing-box(落地机节点)"
+    option=$((option + 1))
+
+    MENU_MAP[$option]="relay_local"
+    if [ -f "$RELAY_HOME/relay.env" ] || [ -f /etc/sing-box/relay.env ]; then
+        echo "$((option))) 线路机/直连节点管理(本机已安装，独立服务 sing-box-relay)"
+    else
+        echo "$((option))) 线路机/直连节点(本机添加直连节点，独立服务 sing-box-relay)"
+    fi
     
     cat <<MENU2
 0) 退出
 ==========================
 MENU2
 }
+
+# 命令行快捷方式: sb relay = 线路机/直连节点管理
+case "${1:-}" in
+    relay) action_relay_local; exit $? ;;
+esac
 
 # 主循环
 while true; do
@@ -4165,6 +4330,7 @@ while true; do
                 update) action_update || true ;;
                 relay) action_generate_relay || true ;;
                 uninstall) action_uninstall; exit 0 ;;
+                relay_local) action_relay_local || true ;;
                 *) warn "无效选项: $opt" ;;
             esac
             ;;
@@ -4177,3 +4343,6 @@ SB_SCRIPT
 chmod +x "$SB_PATH"
 ln -sf /usr/local/bin/sb /usr/bin/sb
 info "✅ 管理面板已创建,可输入 sb 打开管理面板"
+if [ -f /etc/sing-box-relay/relay.env ]; then
+    info "本机的线路机(中转/直连)节点由独立服务 sing-box-relay 运行，未受影响；在 sb 菜单最后一项「线路机/直连节点管理」里管理"
+fi
