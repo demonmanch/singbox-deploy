@@ -2915,6 +2915,8 @@ action_uninstall() {
         fi
     fi
 
+    # Argo 备用入口在落地机节点上时一起卸载（在线路机节点上的不受影响）
+    [ -f /etc/sb-argo/argo.env ] && { run_relay_template argo landing-uninstall || true; }
     info "正在卸载..."
     service_stop || true
     if [ "$OS" = "alpine" ]; then
@@ -2963,7 +2965,7 @@ relay_prepare() {
         run_relay_template upgrade || return 1
     fi
     if [ -f "$RELAY_HOME/relay.env" ] && { [ ! -f "$RELAY_SELF" ] || ! grep -q 'SVC_NAME="sing-box-relay"' "$RELAY_SELF" 2>/dev/null \
-        || ! grep -q 'sb-logrotate' "$RELAY_SELF" 2>/dev/null || ! grep -q 'NAT_CONF=' "$RELAY_SELF" 2>/dev/null; }; then
+        || ! grep -q 'sb-logrotate' "$RELAY_SELF" 2>/dev/null || ! grep -q 'NAT_CONF=' "$RELAY_SELF" 2>/dev/null || ! grep -q 'ARGO_DIR=' "$RELAY_SELF" 2>/dev/null; }; then
         mkdir -p "$RELAY_HOME"
         write_relay_template "$RELAY_SELF"
         chmod 700 "$RELAY_SELF"
@@ -3015,7 +3017,7 @@ current_log_levels() {
 # 是否需要（再）设置日志：清理脚本缺失/旧版、旧的 sb-logclean.sh 还在、未手动选过级别且仍是 info
 log_setup_needed() {
     local f
-    grep -qs 'SB_LOGROTATE_VERSION=1' "$SB_LOG_HELPER" || return 0
+    grep -qs 'SB_LOGROTATE_VERSION=2' "$SB_LOG_HELPER" || return 0
     [ -e /usr/local/bin/sb-logclean.sh ] && return 0
     if [ -d /run/systemd/system ] && [ ! -f /etc/systemd/journald.conf.d/sing-box.conf ]; then return 0; fi
     if [ ! -f "$SB_LOG_PREF" ] && command -v jq >/dev/null 2>&1; then
@@ -4110,13 +4112,14 @@ write_log_helper() {
     cat > "$tmp" <<'LOGROTATE_EOF'
 #!/bin/sh
 # SB_LOGROTATE: sing-box 日志自动清理（由 sb / 线路机脚本安装，每小时运行一次）
-# SB_LOGROTATE_VERSION=1
+# SB_LOGROTATE_VERSION=2
 # 单个日志超过 50MB 时只保留最后约 1MB（原地截断，不用重启服务）；--now 立即清空全部日志
+# 包括 Argo 备用入口 cloudflared 的日志 /var/log/sb-argo.log
 MAX=${SB_LOG_MAX_BYTES:-52428800}
 KEEP=${SB_LOG_KEEP_BYTES:-1048576}
 NOW=0
 [ "${1:-}" = "--now" ] && NOW=1
-for f in /var/log/sing-box*.log /var/log/sing-box*.err; do
+for f in /var/log/sing-box*.log /var/log/sing-box*.err /var/log/sb-argo.log; do
     [ -f "$f" ] || continue
     if [ "$NOW" = 1 ]; then
         : > "$f"
@@ -4446,7 +4449,7 @@ MAIN_URL=https://raw.githubusercontent.com/demonmanch/singbox-deploy/main/instal
 if [ "$(id -u)" != "0" ]; then echo "请以 root 运行 sb"; exit 1; fi
 case "${1:-}" in
     relay) shift; exec bash "$RELAY" "$@" ;;
-    logclean|loglevel|entryip|natports) exec bash "$RELAY" "$@" ;;
+    logclean|loglevel|entryip|natports|argo) exec bash "$RELAY" "$@" ;;
 esac
 while true; do
     echo ""
@@ -4463,6 +4466,7 @@ while true; do
     echo "8) 日志级别(warn/info 切换)"
     echo "9) 入口/出口 IP(修改入口IP 只重新生成链接)"
     echo "10) NAT 映射端口(查看/修改)"
+    echo "11) Argo 备用入口(Cloudflare 临时隧道)"
     echo "0) 退出"
     echo "=========================="
     read -r -p "请输入选项: " opt || exit 0
@@ -4492,6 +4496,7 @@ while true; do
         8) bash "$RELAY" loglevel || true ;;
         9) bash "$RELAY" entryip || true ;;
         10) bash "$RELAY" natports || true ;;
+        11) bash "$RELAY" argo || true ;;
         0) exit 0 ;;
         *) echo "无效选项: $opt" ;;
     esac
@@ -4806,6 +4811,12 @@ delete_node() {
         rm -f "${CONFIG}.tmp"; err "修改失败，配置未改动"; return 1
     fi
     mv "${CONFIG}.tmp" "$CONFIG"
+    # Argo 备用入口的出口正是被删的这台落地机时，改为本机直连出口
+    if argo_enabled && [ "$ARGO_HOST" = "relay" ] && [ "$ARGO_EXIT" = "$R_OUT_TAG" ]; then
+        ARGO_EXIT="direct-out"
+        argo_cfg_add "$CONFIG" && argo_save
+        warn "Argo 备用入口原来从「$pos」出去，已改为本机(线路机)直连出口（Argo 链接不变）"
+    fi
     apply_or_restore || return 1
     rm -f "$CHOSEN"
     save_env
@@ -5052,6 +5063,7 @@ uninstall_relay() {
     warn "本机的落地机节点($LANDING_CONFIG、sing-box 服务)不受影响。"
     read -r -p "确认卸载线路机节点?(y/N): " ans || ans=n
     [[ "$ans" =~ ^[Yy]$ ]] || { info "已取消"; return 0; }
+    argo_on_relay_uninstall || true
     remove_service
     rm -rf "$SB_DIR"
     rm -f "/var/log/${SVC_NAME}.log" "/var/log/${SVC_NAME}.err"
@@ -5118,6 +5130,7 @@ relay_menu() {
     echo "11) 日志级别(warn/info 切换，排查问题时临时用 info)"
     echo "12) 入口/出口 IP(查看；修改入口IP 只重新生成链接)"
     echo "13) NAT 映射端口(查看/修改商家映射端口，新节点自动从中选)"
+    echo "14) Argo 备用入口(Cloudflare 临时隧道，不占映射端口)"
     echo "0) 退出"
     echo "===================================================="
     read -r -p "请选择(直接回车 = 1): " choice || choice=0
@@ -5134,6 +5147,7 @@ relay_menu() {
         11) log_level_menu; return $? ;;
         12) entry_ip_menu; return $? ;;
         13) nat_menu; return 0 ;;
+        14) argo_menu; return 0 ;;
         9)
             if ! landing_valid; then
                 err "本脚本里没有有效的落地机参数。请在落地机上运行 sb → 生成线路机脚本，再用新脚本重新安装。"
@@ -5163,6 +5177,7 @@ usage() {
     echo "  loglevel [warn|info]  切换日志级别(落地机和线路机配置都会改)"
     echo "  entryip [IP]  查看出口IP / 修改入口IP(只重新生成链接)"
     echo "  natports  查看/修改 NAT 映射端口"
+    echo "  argo [show|restart|pref|off]  Argo 备用入口(Cloudflare 临时隧道)"
     echo "  install   全部重新安装(删除所有线路机节点)"
 }
 
@@ -5382,6 +5397,10 @@ fresh_install() {
             apply_direct_config
         fi
     fi
+    # Argo 备用入口在线路机节点上时，把它的本地入站补回新配置（链接不变）
+    if argo_enabled && [ "$ARGO_HOST" = "relay" ]; then
+        argo_cfg_add "$CONFIG" && argo_save
+    fi
 
     if ! check_config; then
         if [ -n "$BAK" ]; then
@@ -5429,6 +5448,753 @@ fresh_install() {
     return 0
 }
 
+# ===== Argo 备用入口：Cloudflare 临时隧道(trycloudflare) → 本机 127.0.0.1 上的 VLESS-ws 入站 =====
+# 入站只监听 127.0.0.1（不占用商家映射端口）；cloudflared 用独立服务 sb-argo；状态在 /etc/sb-argo
+ARGO_DIR="/etc/sb-argo"
+ARGO_ENV="$ARGO_DIR/argo.env"
+ARGO_URI_FILE="$ARGO_DIR/argo_uri.txt"
+ARGO_LOG="/var/log/sb-argo.log"
+ARGO_SVC="sb-argo"
+ARGO_UNIT="/etc/systemd/system/${ARGO_SVC}.service"
+ARGO_INIT="/etc/init.d/${ARGO_SVC}"
+ARGO_TAG="argo-ws-in"
+ARGO_BIN_DEFAULT="/usr/local/bin/cloudflared"
+ARGO_DEF_PREF="www.visa.com.sg"
+ARGO_WAIT="${SB_ARGO_WAIT:-25}"     # 等待隧道建立的秒数
+
+argo_load() {
+    ARGO_HOST=""; ARGO_PORT=""; ARGO_UUID=""; ARGO_PATH=""; ARGO_PREF="$ARGO_DEF_PREF"; ARGO_EXIT="direct-out"
+    ARGO_NAME=""; ARGO_BIN=""; ARGO_BIN_OURS="0"; ARGO_DOMAIN=""; ARGOX_ROLLBACK=""
+    [ -f "$ARGO_ENV" ] || return 1
+    # shellcheck disable=SC1090
+    . "$ARGO_ENV"
+    return 0
+}
+
+argo_save() {
+    mkdir -p "$ARGO_DIR"
+    chmod 700 "$ARGO_DIR" 2>/dev/null || true
+    {
+        printf '# sb Argo 备用入口设置（sb → Argo 备用入口 里修改）\n'
+        printf 'ARGO_HOST=%q\n' "$ARGO_HOST"
+        printf 'ARGO_PORT=%q\n' "$ARGO_PORT"
+        printf 'ARGO_UUID=%q\n' "$ARGO_UUID"
+        printf 'ARGO_PATH=%q\n' "$ARGO_PATH"
+        printf 'ARGO_PREF=%q\n' "$ARGO_PREF"
+        printf 'ARGO_EXIT=%q\n' "$ARGO_EXIT"
+        printf 'ARGO_NAME=%q\n' "$ARGO_NAME"
+        printf 'ARGO_BIN=%q\n' "$ARGO_BIN"
+        printf 'ARGO_BIN_OURS=%q\n' "$ARGO_BIN_OURS"
+        printf 'ARGO_DOMAIN=%q\n' "$ARGO_DOMAIN"
+        printf 'ARGOX_ROLLBACK=%q\n' "$ARGOX_ROLLBACK"
+    } > "$ARGO_ENV"
+    chmod 600 "$ARGO_ENV" 2>/dev/null || true
+}
+
+# Argo 入站所在的配置文件：线路机节点(sing-box-relay) 或 落地机节点(sing-box)
+argo_cfg_file() { if [ "$ARGO_HOST" = "landing" ]; then printf '%s' "$LANDING_CONFIG"; else printf '%s' "$CONFIG"; fi; }
+argo_host_label() { if [ "$ARGO_HOST" = "landing" ]; then printf '落地机节点(sing-box 服务)'; else printf '线路机节点(sing-box-relay 服务)'; fi; }
+
+# 重启 Argo 入站所在的 sing-box 服务；$1=ifactive 时只在服务运行中才重启
+argo_host_restart() {
+    if [ "$ARGO_HOST" = "landing" ]; then
+        if [ "${1:-}" = "ifactive" ] && ! landing_svc active; then return 0; fi
+        landing_svc restart >/dev/null 2>&1
+    else
+        if [ "${1:-}" = "ifactive" ] && ! svc_active; then return 0; fi
+        svc_restart >/dev/null 2>&1
+    fi
+}
+
+# 把 Argo 入站和路由规则写进配置文件 $1（已有就替换）；出口没有了就改成本机直连
+argo_cfg_add() {
+    local f="$1" tmp
+    if ! jq -e --arg t "$ARGO_EXIT" 'any((.outbounds // [])[]; .tag == $t)' "$f" >/dev/null 2>&1; then
+        [ "$ARGO_EXIT" != "direct-out" ] && warn "Argo 原来的出口 $ARGO_EXIT 已不存在，改为本机直连出口"
+        ARGO_EXIT="direct-out"
+    fi
+    tmp="${f}.argo.tmp"
+    jq --argjson port "$ARGO_PORT" --arg uuid "$ARGO_UUID" --arg path "$ARGO_PATH" --arg tag "$ARGO_TAG" --arg out "$ARGO_EXIT" '
+      .inbounds = ([(.inbounds // [])[] | select(.tag != $tag)] + [{
+          "type": "vless",
+          "tag": $tag,
+          "listen": "127.0.0.1",
+          "listen_port": $port,
+          "users": [{ "uuid": $uuid }],
+          "transport": {
+            "type": "ws",
+            "path": $path,
+            "max_early_data": 2560,
+            "early_data_header_name": "Sec-WebSocket-Protocol"
+          }
+        }])
+      | .outbounds = ((.outbounds // []) | if any(.[]; .tag == "direct-out") then . else . + [{"type":"direct","tag":"direct-out"}] end)
+      | .route = ((.route // {}) | .rules = ([(.rules // [])[] | select(.inbound != $tag)] + [{ "inbound": $tag, "outbound": $out }]))
+    ' "$f" > "$tmp" && mv "$tmp" "$f"
+}
+
+# 从配置文件 $1 删除 Argo 入站和它的路由规则（其他节点不动）
+argo_cfg_del() {
+    local f="$1" tmp="${1}.argo.tmp"
+    [ -f "$f" ] || return 0
+    jq -e --arg tag "$ARGO_TAG" 'any((.inbounds // [])[]; .tag == $tag)' "$f" >/dev/null 2>&1 || return 0
+    jq --arg tag "$ARGO_TAG" '
+      .inbounds = [(.inbounds // [])[] | select(.tag != $tag)]
+      | if .route then .route.rules = [(.route.rules // [])[] | select(.inbound != $tag)] else . end
+      | if .route == {"rules": []} then del(.route) else . end
+    ' "$f" > "$tmp" && mv "$tmp" "$f"
+}
+
+# 修改配置：$1=add|del。先备份，sing-box check 不通过就还原；通过后重启所在服务（服务没在运行就不启动）
+argo_apply_cfg() {
+    local f bak
+    f=$(argo_cfg_file)
+    [ -f "$f" ] || { err "未找到配置文件: $f"; return 1; }
+    bak="${f}.bak.argo"
+    cp "$f" "$bak"
+    if [ "$1" = "add" ]; then argo_cfg_add "$f" || { cp "$bak" "$f"; err "写入 Argo 入站失败，配置未改动"; return 1; }
+    else argo_cfg_del "$f" || { cp "$bak" "$f"; err "删除 Argo 入站失败，配置未改动"; return 1; }
+    fi
+    if command -v sing-box >/dev/null 2>&1 && ! sing-box check -c "$f" >/dev/null 2>&1; then
+        sing-box check -c "$f" 2>&1 | tail -n 5 >&2 || true
+        cp "$bak" "$f"; rm -f "$bak"
+        err "配置校验失败，已还原，节点未改动"
+        return 1
+    fi
+    if ! argo_host_restart ifactive; then
+        cp "$bak" "$f"; argo_host_restart ifactive || true; rm -f "$bak"
+        err "重启 $(argo_host_label) 失败，已还原配置"
+        return 1
+    fi
+    rm -f "$bak"
+    return 0
+}
+
+# 本地随机端口：避开 8080/30000/30001(ArgoX 常用)、两套节点已用端口、NAT 映射端口、本机已监听的端口
+argo_port_free() {
+    local p="$1"
+    case "$p" in 8080|30000|30001) return 1 ;; esac
+    nat_load
+    in_words "$p" "$NAT_PORTS" && return 1
+    cfg_has_port "$CONFIG" "$p" && return 1
+    cfg_has_port "$LANDING_CONFIG" "$p" && return 1
+    # 本机已在监听的 TCP 端口（如 ArgoX 的 8080/30000/30001）；ss 优先，busybox 回退 netstat
+    # （先存到变量再 grep：pipefail 下 grep -q 提前退出会让管道失败）
+    local addrs=""
+    if command -v ss >/dev/null 2>&1; then
+        addrs=$(ss -lnt 2>/dev/null | awk 'NR>1{print $4}' || true)
+    elif command -v netstat >/dev/null 2>&1; then
+        addrs=$(netstat -lnt 2>/dev/null | awk '{print $4}' || true)
+    fi
+    printf '%s\n' "$addrs" | grep -qE "[:.]$p\$" && return 1
+    return 0
+}
+argo_pick_port() {
+    local p
+    for _ in $(seq 1 300); do
+        p=$(shuf -i 20000-60000 -n 1 2>/dev/null || echo $((RANDOM % 40001 + 20000)))
+        if argo_port_free "$p"; then printf '%s' "$p"; return 0; fi
+    done
+    return 1
+}
+
+argo_rand_path() {
+    local s
+    s=$(head -c 64 /dev/urandom 2>/dev/null | tr -dc 'a-z0-9' | head -c 12 || true)
+    [ -n "$s" ] || s=$(printf '%s' "$RANDOM$RANDOM$RANDOM" | head -c 12)
+    printf '/%s' "$s"
+}
+
+argo_bin_ok() { [ -n "${1:-}" ] && [ -x "$1" ] && "$1" --version >/dev/null 2>&1; }
+
+argo_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64) echo amd64 ;; aarch64|arm64) echo arm64 ;; armv7*|armv6*|arm) echo arm ;; i?86) echo 386 ;; *) return 1 ;;
+    esac
+}
+
+# 安装 cloudflared：已有能用的就直接用；Alpine 仓库有就用仓库的；否则从 GitHub 下载官方程序（先运行一次确认能用）
+argo_install_bin() {
+    local b avail arch
+    if argo_bin_ok "$ARGO_BIN"; then return 0; fi
+    b=$(command -v cloudflared 2>/dev/null || true)
+    if argo_bin_ok "$b"; then
+        ARGO_BIN="$b"; ARGO_BIN_OURS="0"
+        info "使用本机已有的 cloudflared: $b ($("$b" --version 2>/dev/null | head -n1))"
+        return 0
+    fi
+    avail=$( { df -Pk /usr/local 2>/dev/null || df -Pk / 2>/dev/null; } | awk 'NR==2{print $4}' || true)
+    if [[ "$avail" =~ ^[0-9]+$ ]]; then
+        avail=$((avail / 1024))
+        if [ "$avail" -lt 60 ]; then
+            err "磁盘剩余空间只有约 ${avail}MB，cloudflared 需要约 40MB，空间不够，已停止。可先清理: rm -rf /var/cache/apk/* ; apt-get clean ; 删除不用的日志/文件"
+            return 1
+        fi
+        [ "$avail" -lt 150 ] && warn "磁盘剩余空间约 ${avail}MB，cloudflared 约占 40MB"
+    fi
+    if command -v apk >/dev/null 2>&1 && printf '%s\n' "$(apk --no-cache search -x cloudflared 2>/dev/null || true)" | grep -q '^cloudflared-'; then
+        info "使用 Alpine 官方仓库的 cloudflared"
+        if apk add --no-cache cloudflared >/dev/null 2>&1 && argo_bin_ok /usr/bin/cloudflared; then
+            ARGO_BIN="/usr/bin/cloudflared"; ARGO_BIN_OURS="apk"
+            return 0
+        fi
+        warn "从 Alpine 仓库安装 cloudflared 失败，改从 GitHub 下载"
+    fi
+    arch=$(argo_arch) || { err "不支持的 CPU 架构: $(uname -m)"; return 1; }
+    info "从 GitHub 下载 cloudflared（官方程序 linux-${arch}，约 40MB）..."
+    mkdir -p "$(dirname "$ARGO_BIN_DEFAULT")"
+    if curl -fsSL --max-time 300 -o "${ARGO_BIN_DEFAULT}.new" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}" \
+        && chmod 755 "${ARGO_BIN_DEFAULT}.new" && argo_bin_ok "${ARGO_BIN_DEFAULT}.new"; then
+        mv -f "${ARGO_BIN_DEFAULT}.new" "$ARGO_BIN_DEFAULT"
+        ARGO_BIN="$ARGO_BIN_DEFAULT"; ARGO_BIN_OURS="file"
+        info "cloudflared 已安装: $("$ARGO_BIN" --version 2>/dev/null | head -n1)"
+        return 0
+    fi
+    rm -f "${ARGO_BIN_DEFAULT}.new"
+    err "下载 cloudflared 失败（或下载的程序在本机无法运行）"
+    if [ -z "$(ip -4 route show default 2>/dev/null || true)" ]; then
+        warn "本机可能是纯 IPv6，GitHub 不支持 IPv6；可临时改用 NAT64 DNS 后再试"
+    fi
+    return 1
+}
+
+argo_remove_bin() {
+    case "$ARGO_BIN_OURS" in
+        apk) apk del cloudflared >/dev/null 2>&1 || true ;;
+        file) rm -f "$ARGO_BIN" "${ARGO_BIN}.new" ;;
+    esac
+}
+
+# cloudflared 是 Go 程序：内存 ≤256MiB 时限制约 25%（至少 32MiB）
+argo_gomem() {
+    local m
+    m=$(mem_mib)
+    if [ "$m" -gt 0 ] && [ "$m" -le 256 ]; then
+        m=$((m * 25 / 100)); [ "$m" -lt 32 ] && m=32
+        printf '%sMiB' "$m"
+    fi
+}
+
+argo_service_text() {
+    local gm args
+    gm=$(argo_gomem)
+    args="tunnel --no-autoupdate --protocol http2 --url http://127.0.0.1:${ARGO_PORT}"
+    case "$1" in
+        openrc)
+            echo "#!/sbin/openrc-run"
+            if [ -n "$gm" ]; then
+                echo "export GOMEMLIMIT=${gm}"
+                echo "export GOGC=70"
+            fi
+            cat <<ARGO_SVC_EOF
+name="${ARGO_SVC}"
+description="sb Argo 备用入口 (Cloudflare 临时隧道)"
+command="${ARGO_BIN}"
+command_args="${args}"
+pidfile="/run/${ARGO_SVC}.pid"
+output_log="${ARGO_LOG}"
+error_log="${ARGO_LOG}"
+supervisor=supervise-daemon
+supervise_daemon_args="--respawn-max 0 --respawn-delay 10${gm:+ --env GOMEMLIMIT=${gm} --env GOGC=70}"
+
+depend() {
+    need net
+    after firewall sing-box sing-box-relay
+}
+ARGO_SVC_EOF
+            ;;
+        systemd)
+            cat <<ARGO_SVC_EOF
+[Unit]
+Description=sb Argo 备用入口 (Cloudflare 临时隧道)
+After=network-online.target sing-box.service sing-box-relay.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${ARGO_BIN} ${args}
+Restart=on-failure
+RestartSec=10s
+StandardOutput=append:${ARGO_LOG}
+StandardError=append:${ARGO_LOG}
+${gm:+Environment=GOMEMLIMIT=${gm}
+Environment=GOGC=70
+}
+[Install]
+WantedBy=multi-user.target
+ARGO_SVC_EOF
+            ;;
+    esac
+}
+
+argo_svc() {
+    # $1 = install | start | stop | restart | active | remove
+    local kind
+    kind=$(svc_kind)
+    case "$kind:$1" in
+        openrc:install)
+            argo_service_text openrc > "$ARGO_INIT"; chmod +x "$ARGO_INIT"
+            rc-update add "$ARGO_SVC" default >/dev/null 2>&1 || warn "添加开机自启失败: rc-update add $ARGO_SVC default" ;;
+        systemd:install)
+            argo_service_text systemd > "$ARGO_UNIT"
+            systemctl daemon-reload >/dev/null 2>&1 || true
+            systemctl enable "$ARGO_SVC" >/dev/null 2>&1 || warn "设置开机自启失败: systemctl enable $ARGO_SVC" ;;
+        openrc:active) rc-service "$ARGO_SVC" status >/dev/null 2>&1 ;;
+        systemd:active) systemctl is-active "$ARGO_SVC" >/dev/null 2>&1 ;;
+        openrc:stop) rc-service "$ARGO_SVC" stop >/dev/null 2>&1 || true ;;
+        systemd:stop) systemctl stop "$ARGO_SVC" >/dev/null 2>&1 || true ;;
+        openrc:start|openrc:restart) rc-service "$ARGO_SVC" restart >/dev/null 2>&1 ;;
+        systemd:start|systemd:restart) systemctl restart "$ARGO_SVC" >/dev/null 2>&1 ;;
+        openrc:disable) rc-update del "$ARGO_SVC" default >/dev/null 2>&1 || true ;;
+        systemd:disable) systemctl disable "$ARGO_SVC" >/dev/null 2>&1 || true ;;
+        *:remove)
+            argo_svc stop; argo_svc disable
+            rm -f "$ARGO_INIT" "$ARGO_UNIT"
+            [ "$kind" = "systemd" ] && { systemctl daemon-reload >/dev/null 2>&1 || true; }
+            return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# 日志里最新的临时域名（排除 api.trycloudflare.com）
+argo_parse_domain() {
+    [ -f "$ARGO_LOG" ] || return 0
+    grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$ARGO_LOG" 2>/dev/null | grep -v '^https://api\.' | tail -n 1 | sed 's#^https://##' || true
+}
+
+# 当前域名：日志里有就用日志里最新的（并记下来）；日志被清理过时用记下的
+argo_domain() {
+    local d
+    d=$(argo_parse_domain)
+    if [ -n "$d" ]; then
+        if [ "$d" != "$ARGO_DOMAIN" ]; then ARGO_DOMAIN="$d"; argo_save; fi
+        printf '%s' "$d"
+    elif argo_svc active; then
+        printf '%s' "$ARGO_DOMAIN"
+    fi
+}
+
+argo_link() {
+    local d="$1" pref path name
+    pref="$ARGO_PREF"
+    [[ "$pref" == *:* ]] && pref="[$pref]"
+    path=$(uri_encode "${ARGO_PATH}?ed=2560")
+    name=$(uri_encode "Argo-${ARGO_NAME:-$(hostname 2>/dev/null || echo node)}")
+    printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&host=%s&fp=chrome&type=ws&path=%s#%s\n' \
+        "$ARGO_UUID" "$pref" "$d" "$d" "$path" "$name"
+}
+
+argo_print() {
+    local d
+    d=$(argo_domain)
+    echo ""
+    echo "================ Argo 备用入口 (Cloudflare 临时隧道) ================"
+    echo "   所在节点: $(argo_host_label)，出口: $(argo_exit_label "$ARGO_EXIT")"
+    echo "   优选地址: $ARGO_PREF   本地入站: 127.0.0.1:$ARGO_PORT  路径: $ARGO_PATH"
+    if ! argo_svc active; then
+        warn "隧道服务 $ARGO_SVC 没有运行。选「重启隧道」重新建立（会换新域名）"
+        [ -n "$d" ] || d="$ARGO_DOMAIN"
+    fi
+    if [ -z "$d" ]; then
+        warn "还没有拿到临时域名，稍等几秒再查看，或选「重启隧道」"
+        echo "======================================================================"
+        return 1
+    fi
+    echo "   当前临时域名: $d"
+    argo_link "$d" | tee "$ARGO_URI_FILE"
+    echo "======================================================================"
+    echo "   临时隧道域名在重启隧道/重启机器后会变，变了以后这里会显示新链接（需重新导入）。"
+    return 0
+}
+
+argo_exit_label() {
+    local f
+    if [ "$1" = "direct-out" ]; then
+        if [ "$ARGO_HOST" = "landing" ]; then printf '本机直连'; else printf '本机(线路机)直连'; fi
+        return 0
+    fi
+    list_records
+    for f in ${RECORDS[@]+"${RECORDS[@]}"}; do
+        load_record "$f"
+        if [ "$R_OUT_TAG" = "$1" ]; then printf '落地机「%s」(%s:%s)' "$R_NAME" "$R_SERVER" "$R_SERVER_PORT"; return 0; fi
+    done
+    printf '%s' "$1"
+}
+
+# 等隧道建立：拿到域名且 cloudflared 报告已连上 Cloudflare。失败返回 1 并说明原因
+argo_wait() {
+    local i d=""
+    echo -n "   等待 Cloudflare 临时隧道建立(最多 ${ARGO_WAIT} 秒)"
+    for ((i = 0; i < ARGO_WAIT; i++)); do
+        sleep 1
+        echo -n "."
+        d=$(argo_parse_domain)
+        if [ -n "$d" ] && grep -q 'Registered tunnel connection' "$ARGO_LOG" 2>/dev/null; then
+            echo " 完成"
+            ARGO_DOMAIN="$d"; argo_save
+            return 0
+        fi
+        if ! argo_svc active && [ "$i" -ge 3 ]; then break; fi
+    done
+    echo ""
+    if [ -n "$d" ] && ! grep -q 'Registered tunnel connection' "$ARGO_LOG" 2>/dev/null; then
+        err "本机连不上 Cloudflare 隧道（常见于出口线路干扰 7844 端口），请在线路机上开启 Argo"
+    elif [ -z "$d" ] && grep -qiE 'api\.trycloudflare\.com|quick tunnel|failed to request' "$ARGO_LOG" 2>/dev/null; then
+        err "向 Cloudflare 申请临时域名失败（api.trycloudflare.com 连不上或被限流），请稍后再试"
+    elif grep -qiE '7844|edge|quic|dial|i/o timeout|connection refused|context deadline' "$ARGO_LOG" 2>/dev/null; then
+        err "本机连不上 Cloudflare 隧道（常见于出口线路干扰 7844 端口），请在线路机上开启 Argo"
+    else
+        err "Cloudflare 临时隧道没有建立成功"
+    fi
+    echo "   cloudflared 日志最后几行($ARGO_LOG):"
+    tail -n 6 "$ARGO_LOG" 2>/dev/null | sed 's/^/     /' || true
+    return 1
+}
+
+# 启动/重启隧道（清空旧日志，这样日志里的域名一定是新的）
+argo_start_tunnel() {
+    argo_svc stop
+    : > "$ARGO_LOG" 2>/dev/null || true
+    ARGO_DOMAIN=""; argo_save
+    argo_svc start || true
+    if argo_wait; then return 0; fi
+    argo_svc stop
+    warn "已停止隧道服务 $ARGO_SVC（没有一直卡着重试）。本机其他节点不受影响。"
+    return 1
+}
+
+# ---- 与 fscarmen/ArgoX 共存 ----
+ARGOX_DIR="/etc/argox"
+argox_svc_file() {
+    local s="$1" f
+    for f in "/etc/systemd/system/$s.service" "/lib/systemd/system/$s.service" "/usr/lib/systemd/system/$s.service" "/etc/init.d/$s"; do
+        if [ -f "$f" ] && grep -q '/etc/argox' "$f" 2>/dev/null; then printf '%s' "$f"; return 0; fi
+    done
+    return 1
+}
+argox_services() {
+    local s out=""
+    for s in argo xray nginx cloudflared; do
+        argox_svc_file "$s" >/dev/null && out="$out $s"
+    done
+    printf '%s' "${out# }"
+}
+argox_pids() {
+    local d c
+    for d in /proc/[0-9]*; do
+        [ "${d#/proc/}" = "$$" ] && continue
+        c=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null || true)
+        case "$c" in *"/etc/argox"*) printf '%s\n' "${d#/proc/}" ;; esac
+    done
+    return 0
+}
+argox_present() { [ -d "$ARGOX_DIR" ] || [ -n "$(argox_services)" ]; }
+
+argox_rollback_cmd() {
+    local svcs="$1" nginx_cmd="$2" cmd
+    if [ "$(svc_kind)" = "systemd" ]; then
+        cmd="systemctl enable --now $svcs"
+    else
+        cmd="for s in $svcs; do rc-update add \$s default; rc-service \$s start; done"
+    fi
+    [ -n "$nginx_cmd" ] && cmd="$cmd; sleep 2; pgrep -f 'nginx.*argox' >/dev/null 2>&1 || $nginx_cmd"
+    printf '%s' "$cmd"
+}
+
+# 迁移：停止并禁用 ArgoX 的服务（文件全部保留），打印一行恢复命令
+argox_migrate() {
+    local svcs s pids nginx_cmd="" p
+    svcs=$(argox_services)
+    for s in $svcs; do
+        case "$(svc_kind)" in
+            systemd) systemctl disable --now "$s" >/dev/null 2>&1 || true ;;
+            openrc) rc-service "$s" stop >/dev/null 2>&1 || true; rc-update del "$s" default >/dev/null 2>&1 || true ;;
+        esac
+        info "已停止并禁用 ArgoX 服务: $s"
+    done
+    sleep 1
+    pids=$(argox_pids)
+    for p in $pids; do
+        if [ -z "$nginx_cmd" ] && tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q nginx; then
+            if [ -f "$ARGOX_DIR/nginx.conf" ]; then
+                nginx_cmd="nginx -c $ARGOX_DIR/nginx.conf"
+            else
+                nginx_cmd=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | sed 's/ *$//; s/^nginx: master process //')
+            fi
+        fi
+        kill "$p" 2>/dev/null || true
+    done
+    [ -n "$pids" ] && info "已结束仍在运行的 ArgoX 进程(xray/nginx/cloudflared)"
+    if [ -n "$svcs" ] || [ -n "$nginx_cmd" ]; then
+        ARGOX_ROLLBACK=$(argox_rollback_cmd "${svcs:-argo xray}" "$nginx_cmd")
+    else
+        ARGOX_ROLLBACK=""
+    fi
+    info "ArgoX 的文件全部保留在 $ARGOX_DIR，没有删除。"
+    [ -n "$ARGOX_ROLLBACK" ] && echo "   想恢复 ArgoX，以 root 执行这一行: $ARGOX_ROLLBACK"
+    return 0
+}
+
+# 开启前检查 ArgoX：0=继续 1=取消
+argox_check() {
+    local c svcs
+    argox_present || return 0
+    svcs=$(argox_services)
+    echo ""
+    warn "检测到本机装有 fscarmen/ArgoX（目录 $ARGOX_DIR${svcs:+，服务: $svcs}）"
+    echo "   它也跑一条 Cloudflare 隧道(xray + nginx + cloudflared，占用 8080/30000/30001 等端口)。"
+    echo "   1) 迁移(推荐)：停止并禁用 ArgoX 的服务，文件全部保留，会给出一行恢复命令；省内存，以后只用 sb 管理"
+    echo "   2) 共存：两套都保留（本功能会避开它的端口），但会多占约 40~60MB 内存，256MB 小鸡可能吃紧"
+    echo "   0) 取消"
+    read -r -p "请选择(回车 = 1): " c || c=0
+    case "${c:-1}" in
+        1) argox_migrate; return 0 ;;
+        2) warn "选择共存：两条隧道各自运行，注意内存（free -m 查看）"; return 0 ;;
+        *) info "已取消"; return 1 ;;
+    esac
+}
+
+# 选择出口（线路机：已有的落地机中转出口 / 本机直连；只有一个选项时不问）
+argo_choose_exit() {
+    local tags=() labels=() f i c
+    if [ "$ARGO_HOST" = "landing" ]; then
+        # 链接名用落地机安装时填的节点名称（/root/node_names.txt，如 -kr → Argo-kr）
+        local nn
+        nn=$(sed -n '1{s/^-//;p;}' /root/node_names.txt 2>/dev/null | tr -d '\r' || true)
+        ARGO_EXIT="direct-out"; ARGO_NAME="${ARGO_NAME:-${nn:-直连}}"; return 0
+    fi
+    list_records
+    for f in ${RECORDS[@]+"${RECORDS[@]}"}; do
+        load_record "$f"
+        jq -e --arg t "$R_OUT_TAG" 'any((.outbounds // [])[]; .tag == $t)' "$CONFIG" >/dev/null 2>&1 || continue
+        tags+=("$R_OUT_TAG"); labels+=("落地机「$R_NAME」(${R_SERVER}:${R_SERVER_PORT})|$R_NAME")
+    done
+    tags+=("direct-out"); labels+=("本机(线路机)直连出口|直连")
+    if [ "${#tags[@]}" -eq 1 ]; then ARGO_EXIT="direct-out"; ARGO_NAME="直连"; return 0; fi
+    echo ""
+    echo "Argo 入口的流量从哪里出去?"
+    for i in "${!tags[@]}"; do echo "   $((i + 1))) ${labels[$i]%%|*}"; done
+    while true; do
+        read -r -p "请选择出口(回车 = 1): " c || c=1
+        c="${c:-1}"
+        if [[ "$c" =~ ^[0-9]+$ ]] && [ "$c" -ge 1 ] && [ "$c" -le "${#tags[@]}" ]; then break; fi
+        err "请输入 1-${#tags[@]}"
+    done
+    ARGO_EXIT="${tags[$((c - 1))]}"
+    ARGO_NAME="${labels[$((c - 1))]#*|}"
+}
+
+argo_ask_pref() {
+    local p cur="${ARGO_PREF:-$ARGO_DEF_PREF}"
+    echo "   优选地址 = 客户端实际连接的 Cloudflare 地址（域名或IP）。www.visa.com.sg 在中国移动上实测可用；skk.moe 在移动上不通。"
+    while true; do
+        read -r -p "优选地址(回车 = $cur): " p || p=""
+        p=$(strip_host "${p:-$cur}")
+        if valid_host "$p"; then ARGO_PREF="$p"; return 0; fi
+        err "地址无效: $p（需为域名或 IP）"
+    done
+}
+
+argo_enabled() { [ -f "$ARGO_ENV" ] && argo_load && [ -n "$ARGO_PORT" ]; }
+
+argo_enable() {
+    local rc=0 ans
+    if argo_enabled; then
+        info "Argo 备用入口已经开启"
+        argo_print || true
+        return 0
+    fi
+    command -v jq >/dev/null 2>&1 || { err "需要 jq"; return 1; }
+    argo_load || true
+    if [ -f "$RELAY_ENV" ] && [ -f "$CONFIG" ]; then
+        ARGO_HOST="relay"
+        load_env || return 1
+    elif [ -f "$LANDING_CONFIG" ] && [ -f "$LANDING_DIR/.config_cache" ]; then
+        ARGO_HOST="landing"
+    else
+        err "本机还没有 sing-box 节点（落地机或线路机），请先安装节点再开启 Argo"
+        return 1
+    fi
+    echo ""
+    info "=== 开启 Argo 备用入口（Cloudflare 临时隧道）==="
+    echo "   客户端 → Cloudflare(优选地址:443) → 本机 cloudflared → 本机 127.0.0.1 上的 VLESS-ws 入站 → 出口"
+    echo "   不占用商家映射端口，不改动已有节点和链接。临时隧道是 Cloudflare 的测试服务，域名会变，只适合做备用入口。"
+    echo "   Argo 入站放在: $(argo_host_label)"
+    argox_check || return 0
+    argo_choose_exit
+    argo_ask_pref
+    ARGO_PORT=$(argo_pick_port) || { err "找不到可用的本地端口"; return 1; }
+    ARGO_UUID=$(new_uuid)
+    ARGO_PATH=$(argo_rand_path)
+    argo_install_bin || return 1
+    argo_save
+    if ! argo_apply_cfg add; then
+        argo_remove_bin; rm -rf "$ARGO_DIR"; return 1
+    fi
+    argo_save
+    info "已添加本地入站 127.0.0.1:${ARGO_PORT}（VLESS-ws，路径 ${ARGO_PATH}，出口: $(argo_exit_label "$ARGO_EXIT")）"
+    argo_svc install || true
+    if argo_start_tunnel; then
+        info "✅ Argo 备用入口已开启（服务 $ARGO_SVC，开机自启）"
+        argo_print || true
+        echo "   以后查看/换新域名: sb argo show / sb argo restart；关闭: sb argo off"
+    else
+        rc=1
+        read -r -p "是否撤销本次开启(删除 Argo 入站、服务和 cloudflared)?(Y/n): " ans || ans=""
+        if [[ ! "$ans" =~ ^[Nn]$ ]]; then
+            argo_off yes quiet || true
+            info "已撤销，本机节点没有任何改动"
+        else
+            info "已保留设置（隧道服务已停止）。以后可选「重启隧道」重试，或「关闭/卸载 Argo」"
+        fi
+    fi
+    return "$rc"
+}
+
+# 关闭/卸载：$1=yes 不再确认；$2=quiet 少输出。只删 Argo 自己的入站/服务/程序/设置
+argo_off() {
+    local ans
+    if ! argo_enabled; then
+        [ "${2:-}" = "quiet" ] || info "Argo 备用入口没有开启"
+        return 0
+    fi
+    if [ "${1:-}" != "yes" ]; then
+        read -r -p "确认关闭并卸载 Argo 备用入口(其他节点不受影响)?(y/N): " ans || ans=n
+        [[ "$ans" =~ ^[Yy]$ ]] || { info "已取消"; return 0; }
+    fi
+    argo_svc remove
+    argo_apply_cfg del || warn "删除 Argo 入站失败，请检查 $(argo_cfg_file)"
+    argo_remove_bin
+    rm -f "$ARGO_LOG"
+    if [ -n "$ARGOX_ROLLBACK" ]; then
+        info "如需恢复以前的 ArgoX，以 root 执行: $ARGOX_ROLLBACK"
+    fi
+    rm -rf "$ARGO_DIR"
+    [ "${2:-}" = "quiet" ] || info "✅ Argo 备用入口已关闭并卸载（其他节点和链接没有改动）"
+    return 0
+}
+
+argo_restart() {
+    argo_enabled || { err "Argo 备用入口没有开启"; return 1; }
+    [ -f "$ARGO_INIT" ] || [ -f "$ARGO_UNIT" ] || argo_svc install || true
+    info "重启隧道（会换一个新的临时域名）..."
+    if argo_start_tunnel; then
+        argo_print
+    else
+        return 1
+    fi
+}
+
+argo_pref() {
+    argo_enabled || { err "Argo 备用入口没有开启"; return 1; }
+    if [ -n "${1:-}" ]; then
+        valid_host "$(strip_host "$1")" || { err "地址无效: $1"; return 1; }
+        ARGO_PREF=$(strip_host "$1")
+    else
+        argo_ask_pref
+    fi
+    argo_save
+    info "优选地址已改为 $ARGO_PREF（只改链接，隧道不用重启）"
+    argo_print || true
+}
+
+# 节点配置被重写后（重装落地机/全部重新安装线路机）把 Argo 入站补回去
+argo_reapply() {
+    argo_enabled || return 0
+    local f
+    f=$(argo_cfg_file)
+    [ -f "$f" ] || return 0
+    if jq -e --arg tag "$ARGO_TAG" --arg out "$ARGO_EXIT" 'any((.inbounds // [])[]; .tag == $tag) and any((.route.rules // [])[]; .inbound == $tag and .outbound == $out)' "$f" >/dev/null 2>&1; then
+        return 0
+    fi
+    if argo_apply_cfg add; then
+        argo_save
+        info "已把 Argo 备用入口的本地入站补回 $f（链接不变）"
+    fi
+}
+
+# 线路机节点被卸载时：本机还有落地机节点就问是否把 Argo 挪过去（链接不变），否则一起卸载
+argo_on_relay_uninstall() {
+    local ans
+    argo_enabled || return 0
+    [ "$ARGO_HOST" = "relay" ] || return 0
+    if [ -f "$LANDING_CONFIG" ] && [ -f "$LANDING_DIR/.config_cache" ]; then
+        read -r -p "Argo 备用入口在线路机节点上。是否改到本机落地机节点上继续使用(出口本机，链接不变)?(y/N): " ans || ans=n
+        if [[ "$ans" =~ ^[Yy]$ ]]; then
+            ARGO_HOST="landing"; ARGO_EXIT="direct-out"
+            if argo_apply_cfg add; then
+                argo_save
+                info "Argo 备用入口已改到落地机节点（出口本机直连），链接不变"
+                return 0
+            fi
+            ARGO_HOST="relay"
+        fi
+    fi
+    argo_svc remove
+    argo_remove_bin
+    rm -f "$ARGO_LOG"
+    [ -n "$ARGOX_ROLLBACK" ] && info "如需恢复以前的 ArgoX，以 root 执行: $ARGOX_ROLLBACK"
+    rm -rf "$ARGO_DIR"
+    info "Argo 备用入口已一起卸载"
+}
+
+# 落地机节点被卸载时（sb 调用）：Argo 在落地机上就一起卸载
+argo_on_landing_uninstall() {
+    argo_enabled || return 0
+    [ "$ARGO_HOST" = "landing" ] || return 0
+    argo_svc remove
+    argo_remove_bin
+    rm -f "$ARGO_LOG"
+    [ -n "$ARGOX_ROLLBACK" ] && info "如需恢复以前的 ArgoX，以 root 执行: $ARGOX_ROLLBACK"
+    rm -rf "$ARGO_DIR"
+    info "Argo 备用入口(在落地机节点上)已一起卸载"
+}
+
+argo_menu() {
+    local c
+    while true; do
+        echo ""
+        echo "============ Argo 备用入口 (Cloudflare 临时隧道) ============"
+        argo_load || true
+        if argo_enabled; then
+            if argo_svc active; then echo "   状态: 已开启，隧道运行中"; else echo "   状态: 已开启，隧道未运行"; fi
+        else
+            echo "   状态: 未开启"
+        fi
+        echo "1) 开启"
+        echo "2) 查看当前域名和链接"
+        echo "3) 修改优选地址(当前 ${ARGO_PREF:-$ARGO_DEF_PREF})"
+        echo "4) 重启隧道(换新域名并打印新链接)"
+        echo "5) 关闭/卸载 Argo(只删 Argo 自己的入站/服务/程序，节点不动)"
+        echo "0) 返回"
+        echo "============================================================="
+        read -r -p "请选择: " c || return 0
+        case "$c" in
+            1) argo_enable || true ;;
+            2) if argo_enabled; then argo_print || true; else info "Argo 备用入口没有开启"; fi ;;
+            3) argo_pref || true ;;
+            4) argo_restart || true ;;
+            5) argo_off || true ;;
+            0|"") return 0 ;;
+            *) warn "无效选项: $c" ;;
+        esac
+    done
+}
+
+argo_main() {
+    case "${1:-menu}" in
+        menu) argo_menu ;;
+        on|enable|start) argo_enable ;;
+        show|link) argo_enabled || { info "Argo 备用入口没有开启（开启: sb argo）"; return 0; }; argo_print ;;
+        restart) argo_restart ;;
+        pref) argo_pref "${2:-}" ;;
+        off|uninstall|remove) argo_off "${2:-}" ;;
+        reapply) argo_reapply ;;
+        landing-uninstall) argo_on_landing_uninstall ;;
+        *) err "用法: sb argo [show|restart|pref [地址]|off]"; return 1 ;;
+    esac
+}
+
 # ===== 入口 =====
 MODE="${1:-}"
 case "$MODE" in
@@ -5444,6 +6210,8 @@ case "$MODE" in
     natports|nat) nat_menu; exit 0 ;;
     entryip) entry_ip_menu "${2:-}"; exit $? ;;
     sbinstall) check_disk; rc=0; install_singbox_alpine "${2:-$SB_MIN_VER}" || rc=$?; clean_pkg_cache; exit "$rc" ;;
+    # Argo 备用入口（sb argo …）
+    argo) shift; argo_main "$@"; exit $? ;;
 esac
 
 # 旧版线路机（节点在 /etc/sing-box）先迁移到独立目录/服务；迁移失败就停下，绝不另装一套
@@ -5919,6 +6687,14 @@ MENU
     else
         echo "$((option))) NAT 映射端口(LXC/NAT 小鸡用，当前未开启)"
     fi
+    option=$((option + 1))
+
+    MENU_MAP[$option]="argo"
+    if [ -f /etc/sb-argo/argo.env ]; then
+        echo "$((option))) Argo 备用入口(已开启，Cloudflare 临时隧道)"
+    else
+        echo "$((option))) Argo 备用入口(Cloudflare 临时隧道，不占映射端口)"
+    fi
     
     cat <<MENU2
 0) 退出
@@ -6119,6 +6895,7 @@ fi
 
 # 命令行快捷方式: sb relay = 线路机/直连节点管理；sb logclean / sb loglevel [warn|info]
 # sb addproto = 添加协议；sb entryip [IP] = 入口/出口 IP；sb natports = NAT 映射端口
+# sb argo [show|restart|pref|off] = Argo 备用入口
 case "${1:-}" in
     relay) action_relay_local; exit $? ;;
     logsetup) run_relay_template logauto; exit $? ;;
@@ -6127,6 +6904,7 @@ case "${1:-}" in
     addproto) action_add_protocol; exit $? ;;
     entryip) action_entry_ip "${2:-}"; exit 0 ;;
     natports|nat) action_nat_ports; exit 0 ;;
+    argo) shift; run_relay_template argo "$@"; exit $? ;;
 esac
 
 # 主循环
@@ -6166,6 +6944,7 @@ while true; do
                 add_protocol) action_add_protocol || true ;;
                 entry_ip) action_entry_ip ;;
                 nat_ports) action_nat_ports ;;
+                argo) run_relay_template argo || true ;;
                 *) warn "无效选项: $opt" ;;
             esac
             ;;
@@ -6182,6 +6961,10 @@ info "✅ 管理面板已创建,可输入 sb 打开管理面板"
 "$SB_PATH" logsetup || warn "设置日志自动清理失败，可稍后再运行一次 sb"
 if [ -f /etc/sing-box-relay/relay.env ]; then
     info "本机的线路机(中转/直连)节点由独立服务 sing-box-relay 运行，未受影响；在 sb 菜单「线路机/直连节点管理」里管理"
+fi
+# 重装落地机后：Argo 备用入口在落地机节点上时把它的本地入站补回新配置（链接不变）
+if [ -f /etc/sb-argo/argo.env ]; then
+    "$SB_PATH" argo reapply || warn "恢复 Argo 备用入口失败，可运行 sb argo 查看"
 fi
 # 清理 apk/apt 下载缓存（小硬盘）
 clean_pkg_cache
