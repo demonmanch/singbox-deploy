@@ -5,8 +5,10 @@
 > 一键安装（使用本 fork）：
 >
 > ```bash
-> bash -c "$(curl -fsSL https://raw.githubusercontent.com/demonmanch/singbox-deploy/main/install-singbox-yyds.sh)"
+> curl -fsSL https://raw.githubusercontent.com/demonmanch/singbox-deploy/main/install-singbox-yyds.sh -o /tmp/install-singbox.sh && bash /tmp/install-singbox.sh
 > ```
+>
+> （脚本已超过 128KB，旧写法 `bash -c "$(curl ...)"` 会报 `Argument list too long`，请用上面「先下载再运行」的写法。）
 >
 > 修复 `install-singbox-yyds.sh` 中 `sb` 菜单「生成线路机脚本(出口为本机ss协议)」的问题（在 Alpine 3.21 LXC NAT 小鸡上实际踩坑）：
 >
@@ -137,4 +139,5 @@
 安装全功能 sing-box：
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/demonmanch/singbox-deploy/main/install-singbox-yyds.sh)"
+curl -fsSL https://raw.githubusercontent.com/demonmanch/singbox-deploy/main/install-singbox-yyds.sh -o /tmp/install-singbox.sh && bash /tmp/install-singbox.sh
+```

@@ -38,7 +38,7 @@ info "检测到系统: $OS (${OS_ID:-unknown})"
 check_root() {
     if [ "$(id -u)" != "0" ]; then
         err "此脚本需要 root 权限"
-        err "请使用: sudo bash -c \"\$(curl -fsSL ...)\" 或切换到 root 用户"
+        err "请切换到 root 用户(sudo -i)后再运行: curl -fsSL <脚本地址> -o /tmp/install-singbox.sh && bash /tmp/install-singbox.sh"
         exit 1
     fi
 }
