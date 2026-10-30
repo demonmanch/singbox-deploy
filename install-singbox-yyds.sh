@@ -1210,7 +1210,7 @@ INBOUND_ANYTLS
     cat > "$CONFIG_PATH" <<'CONFIG_HEAD'
 {
   "log": {
-    "level": "info",
+    "level": "warn",
     "timestamp": true
   },
   "ntp": {
@@ -1609,13 +1609,16 @@ if [ "$OS" = "alpine" ]; then
     echo "   重启: rc-service sing-box restart"
     echo "   状态: rc-service sing-box status"
     echo "   日志: tail -f /var/log/sing-box.log"
+    echo "   日志清理: 每小时自动(/usr/local/bin/sb-logrotate，单个日志超过 50MB 只保留最后 1MB)"
 else
     echo "   启动: systemctl start sing-box"
     echo "   停止: systemctl stop sing-box"
     echo "   重启: systemctl restart sing-box"
     echo "   状态: systemctl status sing-box"
     echo "   日志: journalctl -u sing-box -f"
+    echo "   日志清理: journald 最多 50MB；/var/log/sing-box*.log 每小时自动清理(超过 50MB 只保留最后 1MB)"
 fi
+echo "   日志级别默认 warn；输入 sb 可「清理日志」或临时切换到 info 排查问题"
 echo ""
 echo "=========================================="
 
@@ -2327,6 +2330,8 @@ action_uninstall() {
         rm -f /usr/bin/sing-box 2>/dev/null || true
         if [ -L /usr/bin/sb ] && [ ! -e /usr/bin/sb ]; then rm -f /usr/bin/sb; fi
     fi
+    # 本机已没有任何 sing-box 节点时，删除日志清理脚本/定时任务/journald 设置
+    run_relay_template logremove || true
     info "卸载完成"
 }
 
@@ -2351,7 +2356,8 @@ relay_prepare() {
         info "检测到旧版线路机节点(在 /etc/sing-box，和落地机共用 sing-box 服务)，先迁移到独立服务 sing-box-relay（端口/UUID/链接不变）"
         run_relay_template upgrade || return 1
     fi
-    if [ -f "$RELAY_HOME/relay.env" ] && { [ ! -f "$RELAY_SELF" ] || ! grep -q 'SVC_NAME="sing-box-relay"' "$RELAY_SELF" 2>/dev/null; }; then
+    if [ -f "$RELAY_HOME/relay.env" ] && { [ ! -f "$RELAY_SELF" ] || ! grep -q 'SVC_NAME="sing-box-relay"' "$RELAY_SELF" 2>/dev/null \
+        || ! grep -q 'sb-logrotate' "$RELAY_SELF" 2>/dev/null; }; then
         mkdir -p "$RELAY_HOME"
         write_relay_template "$RELAY_SELF"
         chmod 700 "$RELAY_SELF"
@@ -2385,6 +2391,40 @@ action_relay_local() {
         *) ;;
     esac
 }
+
+# ===== 日志（具体实现都在线路机脚本模板里：logauto / logclean / loglevel / logremove）=====
+SB_LOG_HELPER="/usr/local/bin/sb-logrotate"
+SB_LOG_PREF="/etc/sb-log.conf"
+
+# 本机 sing-box 配置当前的日志级别（落地机 / 线路机，没有的跳过），如 "warn" 或 "warn/info"
+current_log_levels() {
+    local f out=""
+    for f in "$CONFIG_PATH" "$RELAY_HOME/config.json"; do
+        [ -f "$f" ] || continue
+        out="${out:+$out/}$(jq -r '.log.level // "info"' "$f" 2>/dev/null || echo '?')"
+    done
+    echo "${out:-无}"
+}
+
+# 是否需要（再）设置日志：清理脚本缺失/旧版、旧的 sb-logclean.sh 还在、未手动选过级别且仍是 info
+log_setup_needed() {
+    local f
+    grep -qs 'SB_LOGROTATE_VERSION=1' "$SB_LOG_HELPER" || return 0
+    [ -e /usr/local/bin/sb-logclean.sh ] && return 0
+    if [ -d /run/systemd/system ] && [ ! -f /etc/systemd/journald.conf.d/sing-box.conf ]; then return 0; fi
+    if [ ! -f "$SB_LOG_PREF" ] && command -v jq >/dev/null 2>&1; then
+        for f in "$CONFIG_PATH" "$RELAY_HOME/config.json"; do
+            [ -f "$f" ] || continue
+            # 线路机脚本只处理本脚本装的落地机配置(有 .config_cache)，与它保持一致，避免每次都调用
+            [ "$f" = "$CONFIG_PATH" ] && [ ! -f "$CACHE_FILE" ] && [ ! -f /etc/sing-box/relay.env ] && continue
+            [ "$(jq -r '.log.level // "info"' "$f" 2>/dev/null)" = "info" ] && return 0
+        done
+    fi
+    return 1
+}
+
+action_log_clean() { run_relay_template logclean || true; }
+action_log_level() { run_relay_template loglevel || true; }
 
 # 线路机脚本模板（落地机参数占位符未替换）：$1=写入路径
 # 线路机节点使用独立目录 /etc/sing-box-relay 和独立服务 sing-box-relay，和落地机节点互不覆盖
@@ -2857,6 +2897,309 @@ landing_svc() {
     esac
 }
 
+# ===== 日志：默认 warn 级别 + 每小时自动清理（落地机 sing-box 和线路机 sing-box-relay 共用）=====
+LOG_HELPER="/usr/local/bin/sb-logrotate"
+LOG_PREF="/etc/sb-log.conf"                         # 用户在菜单里手动选过的日志级别（有它就不再自动改级别）
+CRON_FILE="/etc/crontabs/root"                      # Alpine/busybox crond
+CRON_D="/etc/cron.d/sb-logrotate"                   # Debian/Ubuntu cron
+LOG_TIMER_SVC="/etc/systemd/system/sb-logrotate.service"
+LOG_TIMER="/etc/systemd/system/sb-logrotate.timer"
+JOURNALD_DROPIN="/etc/systemd/journald.conf.d/sing-box.conf"
+OLD_LOGCLEAN="/usr/local/bin/sb-logclean.sh"         # 以前手动加的清理脚本，换成 sb-logrotate
+
+# 本脚本装的落地机配置（有 .config_cache）或旧版线路机配置（有 relay.env）；
+# 不碰 apk/deb 包自带的示例 /etc/sing-box/config.json
+landing_log_config() {
+    [ -f "$LANDING_CONFIG" ] && { [ -f "$LANDING_DIR/.config_cache" ] || [ -f "$LANDING_DIR/relay.env" ]; }
+}
+has_any_config() { landing_log_config || [ -f "$CONFIG" ]; }
+
+# 本机存在的 sing-box 配置（落地机 / 线路机）
+log_configs() {
+    landing_log_config && printf '%s\n' "$LANDING_CONFIG"
+    [ -f "$CONFIG" ] && printf '%s\n' "$CONFIG"
+    return 0
+}
+
+cfg_log_level() { jq -r '.log.level // "info"' "$1" 2>/dev/null || echo "?"; }
+
+# 写入/更新清理脚本（纯 POSIX sh，busybox 可用；只截断不重启，OpenRC 打开的日志文件继续可写）
+write_log_helper() {
+    local tmp
+    tmp=$(mktemp)
+    cat > "$tmp" <<'LOGROTATE_EOF'
+#!/bin/sh
+# SB_LOGROTATE: sing-box 日志自动清理（由 sb / 线路机脚本安装，每小时运行一次）
+# SB_LOGROTATE_VERSION=1
+# 单个日志超过 50MB 时只保留最后约 1MB（原地截断，不用重启服务）；--now 立即清空全部日志
+MAX=${SB_LOG_MAX_BYTES:-52428800}
+KEEP=${SB_LOG_KEEP_BYTES:-1048576}
+NOW=0
+[ "${1:-}" = "--now" ] && NOW=1
+for f in /var/log/sing-box*.log /var/log/sing-box*.err; do
+    [ -f "$f" ] || continue
+    if [ "$NOW" = 1 ]; then
+        : > "$f"
+        continue
+    fi
+    size=$(wc -c < "$f" 2>/dev/null | tr -d ' ')
+    case "$size" in ''|*[!0-9]*) continue ;; esac
+    [ "$size" -gt "$MAX" ] || continue
+    tmp=$(mktemp /tmp/sb-logrotate.XXXXXX) || continue
+    if tail -c "$KEEP" "$f" > "$tmp"; then
+        cat "$tmp" > "$f"
+    fi
+    rm -f "$tmp"
+done
+exit 0
+LOGROTATE_EOF
+    if [ -f "$LOG_HELPER" ] && cmp -s "$tmp" "$LOG_HELPER"; then
+        rm -f "$tmp"
+        return 1   # 无变化
+    fi
+    mkdir -p "$(dirname "$LOG_HELPER")"
+    cat "$tmp" > "$LOG_HELPER"
+    rm -f "$tmp"
+    chmod 755 "$LOG_HELPER"
+    return 0
+}
+
+# 删除以前手动加的 /usr/local/bin/sb-logclean.sh 及其定时任务
+remove_old_logclean() {
+    local f found=false
+    for f in "$CRON_FILE" /var/spool/cron/crontabs/root; do
+        if [ -f "$f" ] && grep -q 'sb-logclean\.sh' "$f" 2>/dev/null; then
+            grep -v 'sb-logclean\.sh' "$f" > "$f.sbtmp" || true
+            cat "$f.sbtmp" > "$f"
+            rm -f "$f.sbtmp"
+            found=true
+        fi
+    done
+    if [ -f "$OLD_LOGCLEAN" ]; then
+        rm -f "$OLD_LOGCLEAN"
+        found=true
+    fi
+    if $found; then
+        info "已删除以前手动添加的 $OLD_LOGCLEAN 及其定时任务，改用 $LOG_HELPER（超过 50MB 只保留最后 1MB）"
+    fi
+    return 0
+}
+
+# 安排每小时运行：OpenRC 用 busybox crond；systemd 优先 cron，没有 cron 用 systemd timer
+schedule_log_helper() {
+    local kind changed=false
+    kind=$(svc_kind)
+    if [ "$kind" = "systemd" ]; then
+        if [ -d /etc/cron.d ] && { command -v cron >/dev/null 2>&1 || command -v crond >/dev/null 2>&1; }; then
+            if ! grep -qs 'sb-logrotate' "$CRON_D"; then
+                printf '# sing-box 日志自动清理（sb 安装）\n0 * * * * root %s >/dev/null 2>&1\n' "$LOG_HELPER" > "$CRON_D"
+                chmod 644 "$CRON_D"
+                changed=true
+            fi
+        elif [ ! -f "$LOG_TIMER" ]; then
+            cat > "$LOG_TIMER_SVC" <<UNIT
+[Unit]
+Description=sing-box 日志自动清理 (sb-logrotate)
+
+[Service]
+Type=oneshot
+ExecStart=$LOG_HELPER
+UNIT
+            cat > "$LOG_TIMER" <<UNIT
+[Unit]
+Description=每小时清理 sing-box 日志 (sb-logrotate)
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+            systemctl daemon-reload >/dev/null 2>&1 || true
+            systemctl enable --now sb-logrotate.timer >/dev/null 2>&1 || warn "启用 sb-logrotate.timer 失败"
+            changed=true
+        fi
+    else
+        mkdir -p "$(dirname "$CRON_FILE")"
+        touch "$CRON_FILE"
+        if ! grep -q 'sb-logrotate' "$CRON_FILE" 2>/dev/null; then
+            printf '0 * * * * %s >/dev/null 2>&1\n' "$LOG_HELPER" >> "$CRON_FILE"
+            changed=true
+        fi
+        if [ "$kind" = "openrc" ]; then
+            if [ ! -f /etc/init.d/crond ] && command -v apk >/dev/null 2>&1; then
+                apk add --no-cache busybox-openrc >/dev/null 2>&1 || true
+            fi
+            if [ -f /etc/init.d/crond ]; then
+                if [ ! -e /etc/runlevels/default/crond ]; then
+                    rc-update add crond default >/dev/null 2>&1 || true
+                    changed=true
+                fi
+                rc-service crond status >/dev/null 2>&1 || rc-service crond start >/dev/null 2>&1 || warn "启动 crond 失败，日志不会自动清理：rc-service crond start"
+            else
+                warn "未找到 crond 服务（/etc/init.d/crond），日志不会自动清理；可运行 apk add busybox-openrc 后再执行一次 sb"
+            fi
+        fi
+    fi
+    $changed && info "已设置每小时自动清理 sing-box 日志（单个日志超过 50MB 时只保留最后 1MB）"
+    return 0
+}
+
+# systemd：限制 journald 日志最多 50MB
+setup_journald() {
+    [ "$(svc_kind)" = "systemd" ] || return 0
+    local want
+    want=$'# sing-box 日志限制（sb 安装）\n[Journal]\nSystemMaxUse=50M'
+    if [ -f "$JOURNALD_DROPIN" ] && [ "$(cat "$JOURNALD_DROPIN")" = "$want" ]; then
+        return 0
+    fi
+    mkdir -p "$(dirname "$JOURNALD_DROPIN")"
+    printf '%s\n' "$want" > "$JOURNALD_DROPIN"
+    systemctl restart systemd-journald >/dev/null 2>&1 || true
+    info "已限制 systemd 日志(journald)最多占用 50MB: $JOURNALD_DROPIN"
+}
+
+# 重启某个配置对应的服务（服务本来没在运行就不启动它）
+restart_for_cfg() {
+    if [ "$1" = "$CONFIG" ]; then
+        svc_active || return 0
+        svc_restart
+    else
+        landing_svc active || return 0
+        landing_svc restart
+    fi
+}
+
+# 把一个配置的日志级别改成 $2：只改 log.level 这一处（其余内容逐字节不变），sing-box check 通过才重启，失败还原
+set_cfg_level() {
+    local cfg="$1" lvl="$2" cur bak
+    cur=$(cfg_log_level "$cfg")
+    [ "$cur" = "$lvl" ] && return 0
+    bak="${cfg}.bak.loglevel.$(date +%Y%m%d%H%M%S)"
+    cp -p "$cfg" "$bak"
+    if jq -e 'has("log") and (.log | has("level"))' "$cfg" >/dev/null 2>&1 \
+        && [ "$(grep -c '"level"[[:space:]]*:[[:space:]]*"'"$cur"'"' "$cfg")" -eq 1 ]; then
+        sed -i 's/\("level"[[:space:]]*:[[:space:]]*"\)'"$cur"'"/\1'"$lvl"'"/' "$cfg"
+    else
+        jq --arg l "$lvl" '.log = ((.log // {}) + {level: $l})' "$bak" > "${cfg}.tmp" && cat "${cfg}.tmp" > "$cfg"
+        rm -f "${cfg}.tmp"
+    fi
+    if [ "$(cfg_log_level "$cfg")" != "$lvl" ] \
+        || [ "$(jq -cS 'del(.log.level)' "$cfg" 2>/dev/null)" != "$(jq -cS 'del(.log.level)' "$bak" 2>/dev/null)" ] \
+        || { command -v sing-box >/dev/null 2>&1 && ! sing-box check -c "$cfg" >/dev/null 2>&1; }; then
+        cp -p "$bak" "$cfg"
+        rm -f "$bak"
+        err "修改 $cfg 的日志级别失败（校验未通过），已还原，服务未重启"
+        return 1
+    fi
+    if ! restart_for_cfg "$cfg" >/dev/null 2>&1; then
+        warn "$cfg 已改为 $lvl，但重启服务失败，已还原为 $cur"
+        cp -p "$bak" "$cfg"
+        restart_for_cfg "$cfg" >/dev/null 2>&1 || true
+        rm -f "$bak"
+        return 1
+    fi
+    rm -f "$bak"
+    info "日志级别: $cfg  $cur → $lvl（运行中的服务已重启）"
+    return 0
+}
+
+# 自动设置（每次运行都会检查，已设置好时什么都不做）：清理脚本 + 定时任务 + journald + info→warn
+log_autosetup() {
+    command -v jq >/dev/null 2>&1 || return 0
+    local cfg
+    has_any_config || return 0               # 本机还没有任何节点
+    write_log_helper && info "已安装日志清理脚本: $LOG_HELPER"
+    remove_old_logclean
+    schedule_log_helper
+    setup_journald
+    # 用户没在菜单里手动选过级别：info 自动改为 warn（只改这一处，节点/端口/密钥/链接都不变）
+    if [ ! -f "$LOG_PREF" ]; then
+        while IFS= read -r -u 3 cfg; do
+            [ "$(cfg_log_level "$cfg")" = "info" ] || continue
+            info "日志级别 info 产生的日志太多（小鸡磁盘可能被写满），改为 warn: $cfg"
+            set_cfg_level "$cfg" warn || true
+        done 3< <(log_configs)
+    fi
+    return 0
+}
+
+# 立即清空日志
+log_clean_now() {
+    local before f
+    before=$(du -ch /var/log/sing-box*.log /var/log/sing-box*.err 2>/dev/null | tail -n1 | awk '{print $1}' || true)
+    if [ -x "$LOG_HELPER" ]; then
+        "$LOG_HELPER" --now
+    else
+        for f in /var/log/sing-box*.log /var/log/sing-box*.err; do [ -f "$f" ] && : > "$f"; done
+    fi
+    info "已清空 sing-box 日志文件(/var/log/sing-box*.log /var/log/sing-box*.err，清理前共 ${before:-0})，服务无需重启"
+    if [ "$(svc_kind)" = "systemd" ] && command -v journalctl >/dev/null 2>&1; then
+        journalctl --vacuum-size=50M >/dev/null 2>&1 || true
+        info "已把 systemd 日志(journald)压缩到 50MB 以内"
+    fi
+}
+
+# 切换日志级别（warn ↔ info），同时作用于本机的落地机和线路机配置；$1 可直接给 warn/info
+log_level_menu() {
+    command -v jq >/dev/null 2>&1 || { err "需要 jq"; return 1; }
+    local cfg lvl="${1:-}" ans rc=0
+    if ! has_any_config; then
+        err "本机还没有 sing-box 节点配置"
+        return 1
+    fi
+    echo "当前日志级别:"
+    while IFS= read -r cfg; do
+        echo "   $cfg: $(cfg_log_level "$cfg")"
+    done < <(log_configs)
+    if [ -z "$lvl" ]; then
+        echo "1) warn（推荐：只记录警告/错误，日志很少）"
+        echo "2) info（排查问题时临时使用：记录每个连接，日志很多，排查完请改回 warn）"
+        read -r -p "请选择(其他键取消): " ans || ans=""
+        case "$ans" in
+            1) lvl=warn ;;
+            2) lvl=info ;;
+            *) info "已取消"; return 0 ;;
+        esac
+    fi
+    case "$lvl" in warn|info) ;; *) err "只支持 warn 或 info"; return 1 ;; esac
+    while IFS= read -r -u 3 cfg; do
+        set_cfg_level "$cfg" "$lvl" || rc=1
+    done 3< <(log_configs)
+    if [ "$rc" -ne 0 ]; then
+        err "部分配置未能修改，未保存日志级别选择"
+        return "$rc"
+    fi
+    printf 'LOG_LEVEL=%s\n' "$lvl" > "$LOG_PREF"
+    info "已记住你的选择($lvl)，以后自动升级不会再改日志级别"
+    [ "$lvl" = "info" ] && warn "info 级别日志很多，排查完请在菜单里改回 warn（日志每小时自动清理，超过 50MB 只保留最后 1MB）"
+    return "$rc"
+}
+
+# 本机落地机和线路机都没有了：删除清理脚本、定时任务、journald 设置
+log_remove() {
+    if has_any_config; then
+        return 0
+    fi
+    rm -f "$LOG_HELPER" "$LOG_PREF" "$CRON_D"
+    if [ -f "$CRON_FILE" ] && grep -q 'sb-logrotate' "$CRON_FILE" 2>/dev/null; then
+        grep -v 'sb-logrotate' "$CRON_FILE" > "$CRON_FILE.sbtmp" || true
+        cat "$CRON_FILE.sbtmp" > "$CRON_FILE"
+        rm -f "$CRON_FILE.sbtmp"
+    fi
+    if [ -f "$LOG_TIMER" ]; then
+        systemctl disable --now sb-logrotate.timer >/dev/null 2>&1 || true
+        rm -f "$LOG_TIMER" "$LOG_TIMER_SVC"
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    if [ -f "$JOURNALD_DROPIN" ]; then
+        rm -f "$JOURNALD_DROPIN"
+        systemctl restart systemd-journald >/dev/null 2>&1 || true
+    fi
+    info "本机已没有 sing-box 节点，已删除日志清理脚本和定时任务"
+}
+
 check_config() {
     if command -v sing-box >/dev/null 2>&1 && ! sing-box check -c "$CONFIG"; then
         return 1
@@ -2923,6 +3266,7 @@ MAIN_URL=https://raw.githubusercontent.com/demonmanch/singbox-deploy/main/instal
 if [ "$(id -u)" != "0" ]; then echo "请以 root 运行 sb"; exit 1; fi
 case "${1:-}" in
     relay) shift; exec bash "$RELAY" "$@" ;;
+    logclean|loglevel) exec bash "$RELAY" "$@" ;;
 esac
 while true; do
     echo ""
@@ -2935,6 +3279,8 @@ while true; do
     echo "4) 重启线路机服务(sing-box-relay)"
     echo "5) 查看线路机服务状态"
     echo "6) 安装落地机节点(运行落地机一键脚本，不影响线路机节点)"
+    echo "7) 清理日志(立即清空 sing-box 日志)"
+    echo "8) 日志级别(warn/info 切换)"
     echo "0) 退出"
     echo "=========================="
     read -r -p "请输入选项: " opt || exit 0
@@ -2960,6 +3306,8 @@ while true; do
                 echo "下载落地机脚本失败: $MAIN_URL"
             fi
             ;;
+        7) bash "$RELAY" logclean || true ;;
+        8) bash "$RELAY" loglevel || true ;;
         0) exit 0 ;;
         *) echo "无效选项: $opt" ;;
     esac
@@ -3524,6 +3872,7 @@ uninstall_relay() {
         if [ -L /usr/bin/sb ] && [ ! -e /usr/bin/sb ]; then rm -f /usr/bin/sb; fi
     fi
     info "✅ 线路机节点已卸载"
+    log_remove
     if [ ! -f "$LANDING_CONFIG" ]; then
         info "本机也没有落地机节点；sing-box 程序保留在 $(singbox_bin)，不需要可自行删除"
     fi
@@ -3575,6 +3924,8 @@ relay_menu() {
     echo "7) 安装/管理本机的落地机节点(sb 完整面板)"
     echo "8) 卸载线路机节点(不影响落地机节点)"
     echo "9) ⚠️ 全部重新安装（删除所有线路机节点，旧链接全部失效）"
+    echo "10) 清理日志(立即清空 sing-box 日志)"
+    echo "11) 日志级别(warn/info 切换，排查问题时临时用 info)"
     echo "0) 退出"
     echo "===================================================="
     read -r -p "请选择(直接回车 = 1): " choice || choice=0
@@ -3587,6 +3938,8 @@ relay_menu() {
         6) svc_restart && info "已重启 $SVC_NAME"; svc_status; return 0 ;;
         7) open_landing; return $? ;;
         8) uninstall_relay; return $? ;;
+        10) log_clean_now; return 0 ;;
+        11) log_level_menu; return $? ;;
         9)
             if ! landing_valid; then
                 err "本脚本里没有有效的落地机参数。请在落地机上运行 sb → 生成线路机脚本，再用新脚本重新安装。"
@@ -3612,6 +3965,8 @@ usage() {
     echo "  upgrade   迁移旧版布局并更新脚本副本(不改节点)"
     echo "  landing   安装/管理本机的落地机节点"
     echo "  uninstall 卸载线路机节点(不影响落地机节点)"
+    echo "  logclean  立即清空 sing-box 日志"
+    echo "  loglevel [warn|info]  切换日志级别(落地机和线路机配置都会改)"
     echo "  install   全部重新安装(删除所有线路机节点)"
 }
 
@@ -3732,7 +4087,7 @@ fresh_install() {
           --arg pk "$REALITY_PK" \
           --arg sid "$REALITY_SID" '
 {
-  "log": { "level": "info", "timestamp": true },
+  "log": { "level": "warn", "timestamp": true },
   "inbounds": [
     {
       "type": "vless",
@@ -3768,7 +4123,7 @@ fresh_install() {
           --arg method "$LANDING_METHOD" \
           --arg password "$LANDING_PASSWORD" '
 {
-  "log": { "level": "info", "timestamp": true },
+  "log": { "level": "warn", "timestamp": true },
   "inbounds": [
     {
       "type": "vless",
@@ -3834,6 +4189,7 @@ fresh_install() {
     save_env
     build_links
     save_self_copy
+    log_autosetup || true
 
     echo ""
     info "✅ 安装完成（线路机节点使用独立服务 $SVC_NAME，不影响本机落地机节点）"
@@ -3857,10 +4213,18 @@ MODE="${1:-}"
 case "$MODE" in
     help|-h|--help) usage; exit 0 ;;
     shortcut) install_shortcut; exit 0 ;;
+    # 日志相关命令不触发旧版迁移（sb 面板启动时也会调用 logauto）
+    logauto|logsetup) log_autosetup; exit 0 ;;
+    logclean) log_clean_now; exit 0 ;;
+    loglevel) log_level_menu "${2:-}"; exit $? ;;
+    logremove) log_remove; exit 0 ;;
 esac
 
 # 旧版线路机（节点在 /etc/sing-box）先迁移到独立目录/服务；迁移失败就停下，绝不另装一套
 maybe_migrate || exit 1
+
+# 日志：清理脚本/定时任务/journald 限制、info→warn（已设置好时什么都不做）
+log_autosetup || true
 
 case "$MODE" in
     rename) rename_node; exit $? ;;
@@ -4287,6 +4651,14 @@ MENU
     else
         echo "$((option))) 线路机/直连节点(本机添加直连节点，独立服务 sing-box-relay)"
     fi
+    option=$((option + 1))
+
+    MENU_MAP[$option]="log_clean"
+    echo "$((option))) 清理日志(立即清空 sing-box 日志)"
+    option=$((option + 1))
+
+    MENU_MAP[$option]="log_level"
+    echo "$((option))) 日志级别(当前 $(current_log_levels)，切换 warn/info)"
     
     cat <<MENU2
 0) 退出
@@ -4294,9 +4666,17 @@ MENU
 MENU2
 }
 
-# 命令行快捷方式: sb relay = 线路机/直连节点管理
+# 日志：首次运行新版 sb 时自动设置（清理脚本 + 每小时定时清理 + info→warn）；已设置好时跳过
+if [ "${1:-}" != "logsetup" ] && log_setup_needed; then
+    run_relay_template logauto || true
+fi
+
+# 命令行快捷方式: sb relay = 线路机/直连节点管理；sb logclean / sb loglevel [warn|info]
 case "${1:-}" in
     relay) action_relay_local; exit $? ;;
+    logsetup) run_relay_template logauto; exit $? ;;
+    logclean) action_log_clean; exit 0 ;;
+    loglevel) run_relay_template loglevel "${2:-}"; exit $? ;;
 esac
 
 # 主循环
@@ -4331,6 +4711,8 @@ while true; do
                 relay) action_generate_relay || true ;;
                 uninstall) action_uninstall; exit 0 ;;
                 relay_local) action_relay_local || true ;;
+                log_clean) action_log_clean ;;
+                log_level) action_log_level ;;
                 *) warn "无效选项: $opt" ;;
             esac
             ;;
@@ -4343,6 +4725,8 @@ SB_SCRIPT
 chmod +x "$SB_PATH"
 ln -sf /usr/local/bin/sb /usr/bin/sb
 info "✅ 管理面板已创建,可输入 sb 打开管理面板"
+# 日志：安装每小时自动清理脚本 /usr/local/bin/sb-logrotate（单个日志超过 50MB 只保留最后 1MB），systemd 限制 journald 50MB
+"$SB_PATH" logsetup || warn "设置日志自动清理失败，可稍后再运行一次 sb"
 if [ -f /etc/sing-box-relay/relay.env ]; then
     info "本机的线路机(中转/直连)节点由独立服务 sing-box-relay 运行，未受影响；在 sb 菜单最后一项「线路机/直连节点管理」里管理"
 fi
