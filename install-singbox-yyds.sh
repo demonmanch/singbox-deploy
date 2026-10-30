@@ -46,6 +46,27 @@ check_root() {
 check_root
 
 # -----------------------
+# 一键恢复(新机器/重装后): bash install-singbox-yyds.sh restore [备份文件]
+# 用脚本里的线路机脚本模板执行恢复：缺 sing-box/服务就安装，恢复配置、校验、启动，最后装好 sb 面板并显示链接
+if [ "${1:-}" = "restore" ]; then
+    shift
+    R_SRC="$0"; R_DL=""; R_TMP=$(mktemp /tmp/sb-restore-tpl.XXXXXX); R_RC=0
+    if ! { [ -f "$R_SRC" ] && grep -q '^RELAY_EOF$' "$R_SRC" 2>/dev/null; }; then
+        R_DL=$(mktemp /tmp/sb-restore-main.XXXXXX)
+        curl -fsSL "https://raw.githubusercontent.com/demonmanch/singbox-deploy/main/install-singbox-yyds.sh" -o "$R_DL" || { err "下载一键脚本失败"; rm -f "$R_DL" "$R_TMP"; exit 1; }
+        R_SRC="$R_DL"
+    fi
+    awk '/<<.RELAY_EOF.$/{f=1;next} /^RELAY_EOF$/{f=0} f' "$R_SRC" > "$R_TMP"
+    if grep -q 'sb_restore()' "$R_TMP" && bash -n "$R_TMP"; then
+        SB_INSTALLER_SRC="$R_SRC" bash "$R_TMP" restore "$@" || R_RC=$?
+    else
+        err "一键脚本里没有找到恢复功能"; R_RC=1
+    fi
+    rm -f "$R_TMP" ${R_DL:+"$R_DL"}
+    exit "$R_RC"
+fi
+
+# -----------------------
 # 检测虚拟化类型和内核版本
 # 新版 sing-box 由 Go 1.24+ 编译，而 Go 1.24 起要求 Linux 内核 >= 3.2（见 Go 1.24 发行说明）
 detect_virt() {
@@ -2020,9 +2041,29 @@ post_install_check() {
     if [ "$SELF_CHECK_FAIL" -ne 0 ]; then
         warn "自检发现问题（见上面 ❌），可以运行 sb 查看状态，或把上面的日志反馈给作者"
     fi
+    tcping_hint
+    return 0
+}
+
+# 自检提示：列出每个 TCP 节点的 入口IP:端口，用 itdog tcping 从国内测试
+tcping_hint() {
+    local h udp=""
+    h="${CUSTOM_IP:-${DETECTED_IP:-你的入口IP}}"
+    h="${h#[}"; h="${h%]}"
+    [[ "$h" == *:* ]] && h="[$h]"
     echo ""
-    info "💡 从外网测试 TCP 端口是否通: 打开 https://www.itdog.cn/tcping/ 或 https://ping.pe/ ，输入 你的IP:端口"
-    info "💡 UDP 端口(HY2/TUIC)无法用 tcping 测试，请直接用客户端连接测试"
+    info "💡 从国内测试端口通不通：打开 https://www.itdog.cn/tcping/ ，把下面每一行(入口IP:端口)粘进去测试"
+    $ENABLE_SS && echo "     ${h}:${PORT_SS}    (SS)"
+    $ENABLE_REALITY && echo "     ${h}:${PORT_REALITY}    (VLESS Reality)"
+    $ENABLE_ANYTLS && echo "     ${h}:${PORT_ANYTLS}    (AnyTLS Reality)"
+    $ENABLE_SS && udp="$udp ${PORT_SS}(SS)"
+    $ENABLE_HY2 && udp="$udp ${PORT_HY2}(HY2)"
+    $ENABLE_TUIC && udp="$udp ${PORT_TUIC}(TUIC)"
+    [ -n "$udp" ] && echo "   UDP 端口无法用 tcping 测试，请直接用客户端连接测试:${udp}"
+    if $NAT_ON; then
+        echo "   NAT 小鸡：在本机内部测不出商家的端口映射是否生效，必须从外网(itdog)测【入口IP:映射端口】"
+    fi
+    echo "   服务器自己判断不了是否被墙（被墙发生在国内那一端），只能从国内测试；以后可在 sb「IP 被墙了？」里再看"
     return 0
 }
 
@@ -2141,6 +2182,8 @@ info "📜 客户端链接:"
 generate_uris | while IFS= read -r line; do
     echo "   $line"
 done
+echo ""
+warn "⚠️ 链接不要分享给别人，避免连接数异常被商家封机"
 echo ""
 info "🔧 管理命令:"
 if [ "$OS" = "alpine" ]; then
@@ -2638,6 +2681,7 @@ action_view_uri() {
     generate_uris || { err "生成 URI 失败"; return 1; }
     echo ""
     cat /etc/sing-box/uris.txt
+    sb_share_reminder
 }
 
 # 查看配置文件路径
@@ -2965,7 +3009,7 @@ relay_prepare() {
         run_relay_template upgrade || return 1
     fi
     if [ -f "$RELAY_HOME/relay.env" ] && { [ ! -f "$RELAY_SELF" ] || ! grep -q 'SVC_NAME="sing-box-relay"' "$RELAY_SELF" 2>/dev/null \
-        || ! grep -q 'sb-logrotate' "$RELAY_SELF" 2>/dev/null || ! grep -q 'NAT_CONF=' "$RELAY_SELF" 2>/dev/null || ! grep -q 'ARGO_DIR=' "$RELAY_SELF" 2>/dev/null; }; then
+        || ! grep -q 'sb-logrotate' "$RELAY_SELF" 2>/dev/null || ! grep -q 'NAT_CONF=' "$RELAY_SELF" 2>/dev/null || ! grep -q 'ARGO_DIR=' "$RELAY_SELF" 2>/dev/null || ! grep -q 'sb_restore()' "$RELAY_SELF" 2>/dev/null; }; then
         mkdir -p "$RELAY_HOME"
         write_relay_template "$RELAY_SELF"
         chmod 700 "$RELAY_SELF"
@@ -3361,10 +3405,12 @@ show_link() {
         fi
         echo "===================================================="
         echo "所有链接也保存在: $RELAY_URI_FILE"
+        share_reminder
     elif [ -f "$RELAY_URI_FILE" ]; then
         echo "=============== 中转节点 Reality 链接 ==============="
         cat "$RELAY_URI_FILE"
         echo "===================================================="
+        share_reminder
     else
         err "未找到 $RELAY_URI_FILE"
         return 1
@@ -4449,7 +4495,7 @@ MAIN_URL=https://raw.githubusercontent.com/demonmanch/singbox-deploy/main/instal
 if [ "$(id -u)" != "0" ]; then echo "请以 root 运行 sb"; exit 1; fi
 case "${1:-}" in
     relay) shift; exec bash "$RELAY" "$@" ;;
-    logclean|loglevel|entryip|natports|argo) exec bash "$RELAY" "$@" ;;
+    logclean|loglevel|entryip|natports|argo|blocked|backup|restore) exec bash "$RELAY" "$@" ;;
 esac
 while true; do
     echo ""
@@ -4467,6 +4513,8 @@ while true; do
     echo "9) 入口/出口 IP(修改入口IP 只重新生成链接)"
     echo "10) NAT 映射端口(查看/修改)"
     echo "11) Argo 备用入口(Cloudflare 临时隧道)"
+    echo "12) IP 被墙了？(怎么测试 + 一键开启 Argo)"
+    echo "13) 备份/恢复"
     echo "0) 退出"
     echo "=========================="
     read -r -p "请输入选项: " opt || exit 0
@@ -4497,6 +4545,8 @@ while true; do
         9) bash "$RELAY" entryip || true ;;
         10) bash "$RELAY" natports || true ;;
         11) bash "$RELAY" argo || true ;;
+        12) bash "$RELAY" blocked || true ;;
+        13) bash "$RELAY" backupmenu || true ;;
         0) exit 0 ;;
         *) echo "无效选项: $opt" ;;
     esac
@@ -5131,6 +5181,8 @@ relay_menu() {
     echo "12) 入口/出口 IP(查看；修改入口IP 只重新生成链接)"
     echo "13) NAT 映射端口(查看/修改商家映射端口，新节点自动从中选)"
     echo "14) Argo 备用入口(Cloudflare 临时隧道，不占映射端口)"
+    echo "15) IP 被墙了？(怎么从国内测试 + 一键开启 Argo 备用入口)"
+    echo "16) 备份/恢复(节点配置和密钥打包到 /root，换机/重装后一键恢复)"
     echo "0) 退出"
     echo "===================================================="
     read -r -p "请选择(直接回车 = 1): " choice || choice=0
@@ -5140,7 +5192,7 @@ relay_menu() {
         3) rename_node; return $? ;;
         4) delete_node; return $? ;;
         5) manage_direct; return $? ;;
-        6) svc_restart && info "已重启 $SVC_NAME"; svc_status; return 0 ;;
+        6) svc_restart && info "已重启 $SVC_NAME"; svc_status; tcp_hint || true; return 0 ;;
         7) open_landing; return $? ;;
         8) uninstall_relay; return $? ;;
         10) log_clean_now; return 0 ;;
@@ -5148,6 +5200,8 @@ relay_menu() {
         12) entry_ip_menu; return $? ;;
         13) nat_menu; return 0 ;;
         14) argo_menu; return 0 ;;
+        15) blocked_guide; return 0 ;;
+        16) backup_menu; return 0 ;;
         9)
             if ! landing_valid; then
                 err "本脚本里没有有效的落地机参数。请在落地机上运行 sb → 生成线路机脚本，再用新脚本重新安装。"
@@ -5178,6 +5232,9 @@ usage() {
     echo "  entryip [IP]  查看出口IP / 修改入口IP(只重新生成链接)"
     echo "  natports  查看/修改 NAT 映射端口"
     echo "  argo [show|restart|pref|off]  Argo 备用入口(Cloudflare 临时隧道)"
+    echo "  blocked   IP 被墙了？(从国内测试的方法 + 一键开启 Argo)"
+    echo "  backup    备份节点配置到 /root/sb-backup-日期-时间.tar.gz"
+    echo "  restore [文件]  从备份恢复(不带文件则列出 /root 下的备份)"
     echo "  install   全部重新安装(删除所有线路机节点)"
 }
 
@@ -5445,6 +5502,7 @@ fresh_install() {
     else
         firewall_reminder "$LISTEN_PORT"
     fi
+    tcp_hint || true
     return 0
 }
 
@@ -6195,6 +6253,485 @@ argo_main() {
     esac
 }
 
+# ===== 分享提醒（每次运行最多显示一次）=====
+share_reminder() {
+    [ -n "${SB_REMINDED:-}" ] && return 0
+    export SB_REMINDED=1
+    echo ""
+    warn "⚠️ 链接不要分享给别人，避免连接数异常被商家封机"
+}
+
+# ===== 端口连通性提示（itdog tcping）=====
+# 输出本机所有对外节点的「标签|端口|tcp/udp/both」（跳过只监听 127.0.0.1 的 Argo 入站）
+node_ports() {
+    local f
+    command -v jq >/dev/null 2>&1 || return 0
+    for f in "$LANDING_CONFIG" "$CONFIG"; do
+        [ -f "$f" ] || continue
+        [ "$f" = "$LANDING_CONFIG" ] && ! landing_log_config && continue
+        jq -r --arg side "$([ "$f" = "$CONFIG" ] && echo 线路机 || echo 落地机)" '
+          (.inbounds // [])[]
+          | select((.listen // "") != "127.0.0.1" and (.listen_port // 0) > 0)
+          | [ $side, (.type // "?"), (.tag // ""), (.listen_port | tostring),
+              (if .type == "shadowsocks" then "both"
+               elif (.type == "hysteria2" or .type == "tuic" or .type == "hysteria") then "udp"
+               else "tcp" end) ] | join("|")' "$f" 2>/dev/null || true
+    done
+}
+
+node_label() {
+    # $1=落地机/线路机 $2=type $3=tag
+    local t
+    case "$2" in
+        shadowsocks) t="SS" ;; hysteria2) t="HY2" ;; tuic) t="TUIC" ;; anytls) t="AnyTLS Reality" ;;
+        vless) t="VLESS Reality" ;; *) t="$2" ;;
+    esac
+    if [ "$1" = "线路机" ]; then
+        if [ "$3" = "vless-direct-in" ]; then t="直连节点"; else t="中转节点"; fi
+        local f
+        list_records
+        for f in ${RECORDS[@]+"${RECORDS[@]}"}; do
+            load_record "$f"
+            [ "$R_IN_TAG" = "$3" ] && { t="中转「$R_NAME」"; break; }
+        done
+    fi
+    printf '%s %s' "$1" "$t"
+}
+
+# 列出 入口IP:端口，提示用 itdog tcping 从国内测试；$1=short 只输出列表和简短说明
+tcp_hint() {
+    local ip host lines udp side type tag port net
+    ip=$(saved_entry_ip)
+    [ -n "$ip" ] || ip="你的入口IP"
+    host="$ip"; [[ "$host" == *:* ]] && host="[$host]"
+    lines=""; udp=""
+    while IFS='|' read -r side type tag port net; do
+        [ -n "$port" ] || continue
+        case "$net" in
+            tcp|both) lines="${lines}     ${host}:${port}    ($(node_label "$side" "$type" "$tag"))"$'\n' ;;
+        esac
+        case "$net" in
+            udp|both) udp="${udp} ${port}($(node_label "$side" "$type" "$tag"))" ;;
+        esac
+    done < <(node_ports)
+    echo ""
+    info "💡 从国内测试端口通不通：打开 https://www.itdog.cn/tcping/ ，把下面每一行(入口IP:端口)粘进去测试"
+    if [ -n "$lines" ]; then printf '%s' "$lines"; else echo "     (本机还没有 TCP 节点)"; fi
+    [ -n "$udp" ] && echo "   UDP 端口无法用 tcping 测试，请直接用客户端连接测试:${udp}"
+    nat_load
+    if nat_on; then
+        echo "   NAT 小鸡：在本机内部测不出商家的端口映射是否生效，必须从外网(itdog)测【入口IP:映射端口】"
+    elif looks_nat; then
+        echo "   如果是 NAT/LXC 小鸡：在本机内部测不出商家的端口映射是否生效，必须从外网(itdog)测【入口IP:映射端口】"
+    fi
+    echo "   服务器自己判断不了是否被墙（被墙发生在国内那一端），只能从国内测试"
+}
+
+# ===== IP 被墙了？（说明 + 一键开启 Argo 备用入口；不做任何自动检测）=====
+blocked_guide() {
+    local ans
+    echo ""
+    info "=== IP 被墙了？==="
+    echo "   常见症状：所有节点突然都连不上/超时，但商家控制台显示机器正常，从国外 SSH 也能登录。"
+    echo "   服务器自己检测不出是否被墙（墙在国内那一端），本脚本也不会自动检测，请按下面的方法从国内测："
+    tcp_hint
+    echo ""
+    echo "   怎么看结果："
+    echo "   - itdog 上全国大部分地区都超时/100% 丢包，而国外(https://ping.pe/ 输入 IP:端口)是通的 → 基本是 IP 被墙"
+    echo "   - 只有个别端口不通、其他端口通 → 端口被封，可在 sb 里「重置端口」换一个"
+    echo "   - 国内国外都不通 → 不是被墙：检查服务是否在运行(sb 查看状态)、商家防火墙/安全组、NAT 映射端口"
+    echo "   - 都能通但客户端连不上 → 不是被墙：检查客户端时间、链接是否最新、SNI 是否可用"
+    echo ""
+    echo "   被墙后的办法："
+    echo "   1) 开启 Argo 备用入口：走 Cloudflare，不依赖本机 IP，被墙时通常还能用（下面可一键开启）"
+    echo "   2) 找商家换 IP；换好后在 sb「入口/出口 IP」填新入口IP，链接重新导入即可（节点、密钥不变）"
+    if argo_enabled; then
+        echo ""
+        info "Argo 备用入口已经开启，当前链接："
+        argo_print || true
+        return 0
+    fi
+    echo ""
+    read -r -p "是否现在一键开启 Argo 备用入口?(y/N): " ans || ans=n
+    if [[ "$ans" =~ ^[Yy]$ ]]; then
+        argo_enable
+        return $?
+    fi
+    info "未开启。以后可在 sb「Argo 备用入口」或输入 sb argo 开启"
+    return 0
+}
+
+# ===== 一键备份 / 恢复 =====
+BACKUP_INFO="sb-backup.info"
+# 备份内容：配置和密钥（不含程序、日志、*.bak 旧配置）
+backup_paths() {
+    local p
+    for p in /etc/sing-box /etc/sing-box-relay /etc/sb-argo; do
+        [ -d "$p" ] || continue
+        find "$p" -type f ! -name '*.bak' ! -name '*.bak.*' ! -name '*.log' ! -name '*.err' \
+            ! -name '*.tmp' ! -path '*/migrated-*' 2>/dev/null || true
+    done
+    for p in /root/node_names.txt /etc/sb-nat.conf /etc/sb-log.conf; do
+        [ -f "$p" ] && printf '%s\n' "$p"
+    done
+    return 0
+}
+
+# $1 = 文件名前缀（默认 sb-backup）。结果路径放在 BACKUP_FILE
+sb_backup() {
+    local prefix="${1:-sb-backup}" quiet="${2:-}" list stage out n=1 parts=""
+    list=$(backup_paths)
+    if [ -z "$list" ]; then
+        err "本机没有可备份的 sing-box 节点配置"
+        return 1
+    fi
+    out="/root/${prefix}-$(date +%Y%m%d-%H%M).tar.gz"
+    while [ -e "$out" ]; do n=$((n + 1)); out="/root/${prefix}-$(date +%Y%m%d-%H%M)-${n}.tar.gz"; done
+    stage=$(mktemp -d /tmp/sb-backup.XXXXXX)
+    printf '%s\n' "$list" | sed 's|^/||' > "$stage/.list"
+    if ! (cd / && tar cf - -T "$stage/.list") | (cd "$stage" && tar xf -); then
+        rm -rf "$stage"; err "打包失败"; return 1
+    fi
+    rm -f "$stage/.list"
+    [ -f /etc/sing-box/config.json ] && parts="$parts 落地机节点"
+    [ -f /etc/sing-box-relay/relay.env ] && parts="$parts 线路机节点"
+    [ -f /etc/sb-argo/argo.env ] && parts="$parts Argo"
+    [ -f /etc/sb-nat.conf ] && parts="$parts NAT设置"
+    {
+        echo "SB_BACKUP_VERSION=1"
+        printf 'CREATED=%q\n' "$(date '+%Y-%m-%d %H:%M:%S %z')"
+        printf 'HOST=%q\n' "$(hostname 2>/dev/null || echo ?)"
+        printf 'ENTRY_IP=%q\n' "$(saved_entry_ip)"
+        printf 'PARTS=%q\n' "${parts# }"
+    } > "$stage/$BACKUP_INFO"
+    if ! (umask 077; tar czf "$out" -C "$stage" .); then
+        rm -rf "$stage" "$out"; err "打包失败"; return 1
+    fi
+    chmod 600 "$out"
+    rm -rf "$stage"
+    BACKUP_FILE="$out"
+    [ "$quiet" = "quiet" ] && return 0
+    info "✅ 已备份到: $out （权限 600，只有 root 可读）"
+    echo "   内容: ${parts# }（配置、密钥、节点名称、NAT/日志设置；不含程序和日志）"
+    warn "备份里有节点密钥/密码，等于全部节点链接，不要分享给别人；请下载到自己电脑保存，例如："
+    echo "   scp -P SSH端口 root@入口IP:$out ."
+    echo "   恢复: 把文件放到新机器 /root/ 下，输入 sb restore（全新机器先用一键脚本: bash install-singbox-yyds.sh restore $out）"
+    return 0
+}
+
+backup_list() {
+    ls -1t /root/sb-backup-*.tar.gz /root/sb-prerestore-*.tar.gz 2>/dev/null || true
+}
+
+# 本机落地机 sing-box 服务（恢复到新机器时用；内容和一键脚本安装的一样）
+landing_service_install() {
+    local bin gm
+    bin=$(singbox_bin)
+    gm=$(relay_gomem)
+    case "$(svc_kind)" in
+        openrc)
+            [ -f /etc/init.d/sing-box ] && return 0
+            {
+                echo "#!/sbin/openrc-run"
+                echo ""
+                if [ -n "$gm" ]; then echo "export GOMEMLIMIT=${gm}"; echo "export GOGC=70"; fi
+                cat <<SVC
+name="sing-box"
+description="Sing-box Proxy Server"
+command="${bin}"
+command_args="run -c /etc/sing-box/config.json"
+pidfile="/run/\${RC_SVCNAME}.pid"
+command_background="yes"
+output_log="/var/log/sing-box.log"
+error_log="/var/log/sing-box.err"
+# 自动拉起（程序崩溃、OOM、被 kill 后自动恢复）
+supervisor=supervise-daemon
+supervise_daemon_args="--respawn-max 0 --respawn-delay 5${gm:+ --env GOMEMLIMIT=${gm} --env GOGC=70}"
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    checkpath --directory --mode 0755 /var/log
+    checkpath --directory --mode 0755 /run
+}
+SVC
+            } > /etc/init.d/sing-box
+            chmod +x /etc/init.d/sing-box
+            rc-update add sing-box default >/dev/null 2>&1 || warn "添加开机自启失败: rc-update add sing-box default"
+            ;;
+        systemd)
+            [ -f /etc/systemd/system/sing-box.service ] && return 0
+            cat > /etc/systemd/system/sing-box.service <<SVC
+[Unit]
+Description=Sing-box Proxy Server
+Documentation=https://sing-box.sagernet.org
+After=network.target nss-lookup.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/etc/sing-box
+ExecStart=${bin} run -c /etc/sing-box/config.json
+ExecReload=/bin/kill -HUP \$MAINPID
+Restart=on-failure
+RestartSec=10s
+LimitNOFILE=1048576
+${gm:+Environment=GOMEMLIMIT=${gm}
+Environment=GOGC=70
+}
+[Install]
+WantedBy=multi-user.target
+SVC
+            systemctl daemon-reload >/dev/null 2>&1 || true
+            systemctl enable sing-box >/dev/null 2>&1 || warn "设置开机自启失败: systemctl enable sing-box"
+            ;;
+        *) warn "未检测到 systemd / OpenRC，无法创建 sing-box 服务"; return 1 ;;
+    esac
+    info "已创建落地机服务 sing-box（开机自启）"
+}
+
+# 恢复需要的工具和 sing-box（缺什么装什么）
+restore_deps() {
+    local need="" c
+    detect_os
+    for c in curl jq tar; do command -v "$c" >/dev/null 2>&1 || need="$need $c"; done
+    [ "${1:-}" = "landing" ] && ! command -v openssl >/dev/null 2>&1 && need="$need openssl"
+    if [ -n "$need" ]; then
+        info "安装依赖:$need"
+        case "$OS" in
+            alpine) apk add --no-cache $need ca-certificates bash >/dev/null || true ;;
+            debian) { apt-get update -y && apt-get install -y $need ca-certificates; } >/dev/null 2>&1 || true ;;
+            redhat) yum install -y $need ca-certificates >/dev/null 2>&1 || true ;;
+        esac
+    fi
+    command -v jq >/dev/null 2>&1 || { err "安装 jq 失败"; return 1; }
+    if ! command -v sing-box >/dev/null 2>&1; then
+        check_disk
+        info "本机没有 sing-box，正在安装..."
+        case "$OS" in
+            alpine) install_singbox_alpine "$SB_MIN_VER" || true ;;
+            *) (cd "$(mktemp -d)" && bash <(curl -fsSL https://sing-box.app/install.sh)) || true ;;
+        esac
+        clean_pkg_cache
+        command -v sing-box >/dev/null 2>&1 || { err "sing-box 安装失败"; return 1; }
+        info "sing-box 版本: $(sb_version)"
+    fi
+    return 0
+}
+
+# 把目录 $1 里的文件按原路径复制到 /（只复制文件，不改动 /、/etc、/root 等已有目录的权限）
+restore_copy_tree() {
+    local src="$1" f
+    while IFS= read -r f; do
+        f="${f#./}"
+        [ "$f" = "$BACKUP_INFO" ] && continue
+        mkdir -p "/$(dirname "$f")" && cp -p "$src/$f" "/$f" || return 1
+    done < <(cd "$src" && find . -type f)
+    return 0
+}
+
+# 把预恢复备份 $1 还原回去（恢复失败时用）；$2 = 本次要覆盖的目录/文件列表
+restore_rollback() {
+    local pre="$1" items="$2" p tmpd
+    for p in $items; do rm -rf "$p"; done
+    if [ -n "$pre" ] && [ -f "$pre" ]; then
+        tmpd=$(mktemp -d /tmp/sb-rb.XXXXXX)
+        tar xzf "$pre" -C "$tmpd" 2>/dev/null || true
+        restore_copy_tree "$tmpd" || true
+        rm -rf "$tmpd"
+        warn "已还原为恢复前的配置（$pre）"
+    fi
+    # 把原来在运行的服务拉起来
+    if [ -f "$LANDING_CONFIG" ]; then landing_svc restart >/dev/null 2>&1 || true; fi
+    if [ -f "$CONFIG" ] && service_installed; then svc_restart >/dev/null 2>&1 || true; fi
+    if argo_enabled; then argo_svc start >/dev/null 2>&1 || true; fi
+    return 0
+}
+
+# 恢复：$1 = 备份文件（可空，空则列出 /root 下的备份让你选）
+# 用户取消时：从 sb 面板调用(SB_FROM_PANEL)返回 10，面板据此不再显示链接
+sb_restore() {
+    local file="${1:-}" files=() i c tmpd items="" pre="" exists=0 ans p has_land=0 has_relay=0 has_argo=0 cur new
+    if [ -z "$file" ]; then
+        mapfile -t files < <(backup_list)
+        if [ "${#files[@]}" -eq 0 ]; then
+            err "/root 下没有找到备份文件(sb-backup-*.tar.gz)。请先把备份文件上传到 /root/，或用 sb restore 文件路径"
+            return 1
+        fi
+        echo ""
+        echo "找到这些备份（新的在前）："
+        for i in "${!files[@]}"; do echo "   $((i + 1))) ${files[$i]}"; done
+        read -r -p "请选择要恢复的备份(回车 = 1，0 = 取消): " c || c=0
+        c="${c:-1}"
+        if ! [[ "$c" =~ ^[0-9]+$ ]] || [ "$c" -lt 1 ] || [ "$c" -gt "${#files[@]}" ]; then info "已取消"; [ -n "${SB_FROM_PANEL:-}" ] && return 10; return 0; fi
+        file="${files[$((c - 1))]}"
+    fi
+    [ -f "$file" ] || { err "找不到备份文件: $file"; return 1; }
+    command -v tar >/dev/null 2>&1 || { err "需要 tar"; return 1; }
+    tmpd=$(mktemp -d /tmp/sb-restore.XXXXXX)
+    if ! tar xzf "$file" -C "$tmpd" 2>/dev/null || [ ! -f "$tmpd/$BACKUP_INFO" ]; then
+        rm -rf "$tmpd"; err "不是 sb 备份文件(或文件已损坏): $file"; return 1
+    fi
+    chmod 700 "$tmpd"
+    [ -f "$tmpd/etc/sing-box/config.json" ] && has_land=1
+    [ -f "$tmpd/etc/sing-box-relay/relay.env" ] && has_relay=1
+    [ -f "$tmpd/etc/sb-argo/argo.env" ] && has_argo=1
+    echo ""
+    info "=== 从备份恢复: $file ==="
+    (
+        # shellcheck disable=SC1090,SC1091
+        . "$tmpd/$BACKUP_INFO" 2>/dev/null || true
+        echo "   备份时间: ${CREATED:-?}   原机器: ${HOST:-?}   原入口IP: ${ENTRY_IP:-?}"
+        echo "   内容: ${PARTS:-?}"
+    )
+    # 本次会覆盖的目录/文件（备份里有的才覆盖，备份里没有的部分保持本机原样）
+    [ "$has_land" = 1 ] && items="$items /etc/sing-box"
+    [ "$has_relay" = 1 ] && items="$items /etc/sing-box-relay"
+    [ "$has_argo" = 1 ] && items="$items /etc/sb-argo"
+    for p in /root/node_names.txt /etc/sb-nat.conf /etc/sb-log.conf; do
+        [ -f "$tmpd$p" ] && items="$items $p"
+    done
+    for p in $items; do
+        case "$p" in
+            /etc/sing-box) [ -f /etc/sing-box/config.json ] && exists=1 ;;
+            /etc/sing-box-relay) [ -f /etc/sing-box-relay/relay.env ] && exists=1 ;;
+            /etc/sb-argo) [ -f /etc/sb-argo/argo.env ] && exists=1 ;;
+        esac
+    done
+    if [ "$exists" = 1 ]; then
+        warn "本机已有节点配置，恢复会【覆盖】这些:${items}"
+        echo "   覆盖前会先把本机现在的配置备份到 /root/sb-prerestore-*.tar.gz，可以随时恢复回来。"
+        read -r -p "确认覆盖本机配置?(y/N): " ans || ans=n
+        [[ "$ans" =~ ^[Yy]$ ]] || { rm -rf "$tmpd"; info "已取消，本机没有任何改动"; [ -n "${SB_FROM_PANEL:-}" ] && return 10; return 0; }
+        sb_backup sb-prerestore quiet || { rm -rf "$tmpd"; err "恢复前备份失败，已取消"; return 1; }
+        pre="$BACKUP_FILE"
+        info "恢复前的配置已备份到: $pre"
+    else
+        read -r -p "确认恢复?(Y/n): " ans || ans=y
+        [[ "$ans" =~ ^[Nn]$ ]] && { rm -rf "$tmpd"; info "已取消"; [ -n "${SB_FROM_PANEL:-}" ] && return 10; return 0; }
+    fi
+    if [ "$has_land" = 1 ]; then restore_deps landing || { rm -rf "$tmpd"; return 1; }
+    else restore_deps || { rm -rf "$tmpd"; return 1; }; fi
+    # 停服务 → 换文件
+    [ "$has_land" = 1 ] && { landing_svc stop >/dev/null 2>&1 || true; }
+    [ "$has_relay" = 1 ] && svc_stop
+    [ "$has_argo" = 1 ] && { argo_svc stop >/dev/null 2>&1 || true; }
+    for p in $items; do rm -rf "$p"; done
+    if ! restore_copy_tree "$tmpd"; then
+        err "写入文件失败"
+        restore_rollback "$pre" "$items"; rm -rf "$tmpd"; return 1
+    fi
+    rm -rf "$tmpd"
+    chmod 600 /root/node_names.txt 2>/dev/null || true
+    # 校验
+    for p in "$LANDING_CONFIG" "$CONFIG"; do
+        { [ "$p" = "$LANDING_CONFIG" ] && [ "$has_land" = 1 ]; } || { [ "$p" = "$CONFIG" ] && [ "$has_relay" = 1 ]; } || continue
+        if ! sing-box check -c "$p" >/dev/null 2>&1; then
+            err "恢复后的配置 $p 没有通过 sing-box check："
+            sing-box check -c "$p" 2>&1 | tail -n 5 | sed 's/^/     /' || true
+            err "本机的 sing-box($(sb_version)) 可能比原机器旧，可先在 sb 里「更新 sing-box」再恢复"
+            restore_rollback "$pre" "$items"
+            [ -z "$pre" ] && warn "本机原来没有这些配置，已清理掉恢复的文件"
+            return 1
+        fi
+    done
+    info "配置校验通过(sing-box check)"
+    # 服务
+    if [ "$has_land" = 1 ]; then
+        landing_service_install || true
+        landing_svc restart >/dev/null 2>&1 && info "已启动落地机服务 sing-box" || warn "启动 sing-box 失败，请运行 sb 查看状态"
+    fi
+    if [ "$has_relay" = 1 ]; then
+        if service_installed; then refresh_service; else install_service || true; fi
+        svc_restart >/dev/null 2>&1 && info "已启动线路机服务 $SVC_NAME" || warn "启动 $SVC_NAME 失败，请运行: bash $SELF_COPY status"
+        # 备份里的线路机脚本副本够新就保留（里面可能有落地机参数），太旧才换成当前版本
+        if [ ! -f "$SELF_COPY" ] || ! grep -q 'sb_restore()' "$SELF_COPY" 2>/dev/null; then
+            save_self_copy
+        else
+            write_shim; install_shortcut
+        fi
+    fi
+    log_autosetup >/dev/null 2>&1 || true
+    # 备份里没有 Argo、本机原来开着 Argo：把它的入站补回被覆盖的配置（Argo 链接不变）
+    if [ "$has_argo" = 0 ] && argo_enabled; then argo_reapply || true; fi
+    # 入口IP：商家重装/换机后可能变了
+    cur=$(saved_entry_ip)
+    echo ""
+    echo "   入口IP(链接里用的地址)现在是: ${cur:-未设置}。商家重装系统或换了机器后入口IP 可能变了。"
+    read -r -p "如需修改，输入新的入口IP/域名(回车保持不变): " new || new=""
+    new=$(strip_host "$new")
+    if [ -n "$new" ] && [ "$new" != "$cur" ]; then
+        entry_ip_menu "$new" >/dev/null || warn "修改入口IP 失败，可稍后在 sb「入口/出口 IP」里修改"
+        info "入口IP 已改为 $new（链接里的地址随之改变，节点、端口、密钥不变）"
+    fi
+    info "✅ 恢复完成（端口、密钥、链接和备份时一样）"
+    if [ "$has_relay" = 1 ]; then
+        echo ""
+        show_link || true
+    fi
+    if [ "$has_argo" = 1 ] && argo_enabled; then
+        echo ""
+        info "重新建立 Argo 临时隧道（临时域名会变，需要重新导入 Argo 链接）..."
+        if ! argo_bin_ok "$ARGO_BIN"; then ARGO_BIN=""; argo_install_bin || true; fi
+        if argo_bin_ok "$ARGO_BIN"; then
+            argo_save
+            argo_svc install || true
+            if argo_start_tunnel; then argo_print || true; else warn "Argo 隧道没有建立，可稍后运行 sb argo restart"; fi
+        else
+            warn "cloudflared 没装好，Argo 暂不可用，可稍后运行 sb argo restart"
+        fi
+    fi
+    if [ "$has_land" = 1 ] && [ -z "${SB_FROM_PANEL:-}" ]; then
+        restore_panel
+    fi
+    [ -z "${SB_FROM_PANEL:-}" ] && share_reminder
+    return 0
+}
+
+# 恢复了落地机节点、但本机 sb 还不是完整面板时：装完整面板并显示落地机链接
+restore_panel() {
+    local src="${SB_INSTALLER_SRC:-}" tmp tmpp
+    if [ -f "$SB_CMD" ] && ! is_shortcut "$SB_CMD" && grep -q 'action_view_uri' "$SB_CMD" 2>/dev/null; then
+        echo ""; "$SB_CMD" links || true; export SB_REMINDED=1; return 0
+    fi
+    tmp=$(mktemp /tmp/sb-main.XXXXXX); tmpp=$(mktemp /tmp/sb-panel.XXXXXX)
+    if [ -z "$src" ] || [ ! -f "$src" ]; then
+        if curl -fsSL "$MAIN_URL" -o "$tmp"; then src="$tmp"; fi
+    fi
+    if [ -n "$src" ] && awk '/<<.SB_SCRIPT.$/{f=1;next} /^SB_SCRIPT$/{f=0} f' "$src" > "$tmpp" \
+        && grep -q pinSHA256 "$tmpp" && bash -n "$tmpp"; then
+        mkdir -p "$(dirname "$SB_CMD")"
+        cp "$tmpp" "$SB_CMD" && chmod +x "$SB_CMD" && ln -sf "$SB_CMD" /usr/bin/sb 2>/dev/null || true
+        info "已安装 sb 管理面板: $SB_CMD"
+        echo ""
+        "$SB_CMD" links || true
+        export SB_REMINDED=1    # 面板显示链接时已经提醒过
+    else
+        warn "下载 sb 面板失败；落地机节点已恢复并在运行。以后执行一键脚本里的「更新 sb 面板」命令即可，链接用 sb → 1 查看"
+    fi
+    rm -f "$tmp" "$tmpp"
+}
+
+backup_menu() {
+    local c
+    echo ""
+    echo "============ 备份 / 恢复 ============"
+    echo "1) 立即备份(生成 /root/sb-backup-日期-时间.tar.gz)"
+    echo "2) 从备份恢复(列出 /root 下的备份)"
+    echo "0) 返回"
+    echo "====================================="
+    read -r -p "请选择: " c || return 0
+    case "$c" in
+        1) sb_backup ;;
+        2) sb_restore ;;
+        *) return 0 ;;
+    esac
+}
+
 # ===== 入口 =====
 MODE="${1:-}"
 case "$MODE" in
@@ -6212,6 +6749,13 @@ case "$MODE" in
     sbinstall) check_disk; rc=0; install_singbox_alpine "${2:-$SB_MIN_VER}" || rc=$?; clean_pkg_cache; exit "$rc" ;;
     # Argo 备用入口（sb argo …）
     argo) shift; argo_main "$@"; exit $? ;;
+    # IP 被墙了？/ 备份 / 恢复 / 端口测试提示
+    blocked|wall) blocked_guide; exit $? ;;
+    backup) sb_backup; exit $? ;;
+    backupmenu) backup_menu; exit $? ;;
+    restore) shift; sb_restore "$@"; exit $? ;;
+    tcphint) tcp_hint; exit 0 ;;
+    reminder) share_reminder; exit 0 ;;
 esac
 
 # 旧版线路机（节点在 /etc/sing-box）先迁移到独立目录/服务；迁移失败就停下，绝不另装一套
@@ -6229,7 +6773,7 @@ case "$MODE" in
     upgrade|migrate) do_upgrade; exit $? ;;
     uninstall) uninstall_relay; exit $? ;;
     restart) svc_restart && info "已重启 $SVC_NAME"; svc_status; exit 0 ;;
-    status) svc_status; exit 0 ;;
+    status) svc_status; tcp_hint || true; exit 0 ;;
     landing) open_landing; exit $? ;;
     install)
         if [ -f "$RELAY_ENV" ]; then
@@ -6695,6 +7239,14 @@ MENU
     else
         echo "$((option))) Argo 备用入口(Cloudflare 临时隧道，不占映射端口)"
     fi
+    option=$((option + 1))
+
+    MENU_MAP[$option]="blocked"
+    echo "$((option))) IP 被墙了？(怎么从国内测试 + 一键开启 Argo 备用入口)"
+    option=$((option + 1))
+
+    MENU_MAP[$option]="backup"
+    echo "$((option))) 备份/恢复(节点配置和密钥打包到 /root，换机/重装后一键恢复)"
     
     cat <<MENU2
 0) 退出
@@ -6888,6 +7440,46 @@ action_entry_ip() {
 # NAT 映射端口（查看端口→协议表 / 修改映射端口列表 / 开关 NAT 模式）
 action_nat_ports() { run_relay_template natports || true; }
 
+# 分享提醒：每次运行 sb 最多显示一次
+sb_share_reminder() {
+    [ -n "${SB_REMINDED:-}" ] && return 0
+    SB_REMINDED=1
+    echo ""
+    warn "⚠️ 链接不要分享给别人，避免连接数异常被商家封机"
+}
+
+# 从备份恢复（具体实现在线路机脚本模板里）；恢复了落地机节点就显示落地机链接
+action_restore() {
+    local rc=0
+    SB_FROM_PANEL=1 SB_REMINDED=1 run_relay_template restore "$@" || rc=$?
+    [ "$rc" -eq 10 ] && return 0
+    [ "$rc" -eq 0 ] || return "$rc"
+    if [ -f /etc/sing-box/config.json ] && [ -f /etc/sing-box/.config_cache ]; then
+        echo ""
+        info "落地机节点链接："
+        action_view_uri || true
+    else
+        sb_share_reminder
+    fi
+    return 0
+}
+
+action_backup_menu() {
+    local c
+    echo ""
+    echo "============ 备份 / 恢复 ============"
+    echo "1) 立即备份(生成 /root/sb-backup-日期-时间.tar.gz)"
+    echo "2) 从备份恢复(列出 /root 下的备份)"
+    echo "0) 返回"
+    echo "====================================="
+    read -r -p "请选择: " c || return 0
+    case "$c" in
+        1) run_relay_template backup || true ;;
+        2) action_restore || true ;;
+    esac
+    return 0
+}
+
 # 日志：首次运行新版 sb 时自动设置（清理脚本 + 每小时定时清理 + info→warn）；已设置好时跳过
 if [ "${1:-}" != "logsetup" ] && log_setup_needed; then
     run_relay_template logauto || true
@@ -6896,6 +7488,7 @@ fi
 # 命令行快捷方式: sb relay = 线路机/直连节点管理；sb logclean / sb loglevel [warn|info]
 # sb addproto = 添加协议；sb entryip [IP] = 入口/出口 IP；sb natports = NAT 映射端口
 # sb argo [show|restart|pref|off] = Argo 备用入口
+# sb blocked = IP 被墙了？；sb backup / sb restore [文件] = 备份/恢复；sb links = 显示落地机链接
 case "${1:-}" in
     relay) action_relay_local; exit $? ;;
     logsetup) run_relay_template logauto; exit $? ;;
@@ -6905,6 +7498,10 @@ case "${1:-}" in
     entryip) action_entry_ip "${2:-}"; exit 0 ;;
     natports|nat) action_nat_ports; exit 0 ;;
     argo) shift; run_relay_template argo "$@"; exit $? ;;
+    blocked|wall) run_relay_template blocked; exit $? ;;
+    backup) run_relay_template backup; exit $? ;;
+    restore) shift; action_restore "$@"; exit $? ;;
+    links) action_view_uri; exit $? ;;
 esac
 
 # 主循环
@@ -6934,7 +7531,7 @@ while true; do
                 start) service_start && info "已启动" ;;
                 stop) service_stop && info "已停止" ;;
                 restart) service_restart && info "已重启" ;;
-                status) service_status ;;
+                status) service_status; run_relay_template tcphint || true ;;
                 update) action_update || true ;;
                 relay) action_generate_relay || true ;;
                 uninstall) action_uninstall; exit 0 ;;
@@ -6945,6 +7542,8 @@ while true; do
                 entry_ip) action_entry_ip ;;
                 nat_ports) action_nat_ports ;;
                 argo) run_relay_template argo || true ;;
+                blocked) run_relay_template blocked || true ;;
+                backup) action_backup_menu || true ;;
                 *) warn "无效选项: $opt" ;;
             esac
             ;;
