@@ -107,7 +107,10 @@ detect_mem() {
     GO_MEMLIMIT=""
     if [ "$MEM_MIB" -gt 0 ] && [ "$MEM_MIB" -le 256 ]; then
         LOW_MEM=true
-        GO_MEMLIMIT="$((MEM_MIB * 75 / 100))MiB"
+        # 本机还有线路机节点(sing-box-relay)时两个 sing-box 进程各用约 45%，否则 75%
+        local pct=75
+        [ -f /etc/sing-box-relay/relay.env ] && pct=45
+        GO_MEMLIMIT="$((MEM_MIB * pct / 100))MiB"
         warn "检测到本机可用内存只有约 ${MEM_MIB} MiB（≤256 MiB），已启用低内存模式："
         warn "   sing-box 服务将设置 GOMEMLIMIT=${GO_MEMLIMIT} GOGC=70，减少被系统 OOM 杀掉的概率"
         warn "   建议下面只选 1~2 个协议（例如只选 VLESS Reality，或 Reality + SS）"
@@ -118,15 +121,55 @@ detect_mem() {
 
 detect_mem
 
+# ===== 磁盘 / 安装缓存 =====
+check_disk() {
+    local avail
+    avail=$(df -Pk / 2>/dev/null | awk 'NR==2{print $4}' || true)
+    [[ "$avail" =~ ^[0-9]+$ ]] || return 0
+    avail=$((avail / 1024))
+    if [ "$avail" -lt 150 ]; then
+        warn "磁盘剩余空间只有约 ${avail} MB（低于 150MB）：安装 sing-box 需要约 50~80MB，空间不足可能失败。"
+        warn "   可先清理: rm -rf /var/cache/apk/* ; apt-get clean ; 删除不用的日志/文件"
+    else
+        info "磁盘剩余空间: 约 ${avail} MB"
+    fi
+}
+clean_pkg_cache() {
+    if command -v apk >/dev/null 2>&1; then
+        rm -rf /var/cache/apk/* 2>/dev/null || true
+    elif command -v apt-get >/dev/null 2>&1; then
+        apt-get clean >/dev/null 2>&1 || true
+    fi
+}
+
+check_disk
+
 # -----------------------
-# 安装依赖
+# 安装依赖（只装缺少的；openssl 等到选了需要它的协议再装）
+# 必需: curl(下载) ca-certificates(HTTPS) jq(sb 面板读配置) bash；Alpine 另需 openrc(服务)
+missing_pkgs() {
+    local m=""
+    command -v curl >/dev/null 2>&1 || m="$m curl"
+    command -v jq >/dev/null 2>&1 || m="$m jq"
+    command -v bash >/dev/null 2>&1 || m="$m bash"
+    [ -s /etc/ssl/certs/ca-certificates.crt ] || [ -s /etc/pki/tls/certs/ca-bundle.crt ] || m="$m ca-certificates"
+    if [ "$OS" = "alpine" ]; then command -v rc-service >/dev/null 2>&1 || m="$m openrc"; fi
+    printf '%s' "${m# }"
+}
+
 install_deps() {
-    info "安装系统依赖..."
+    local pk
+    pk=$(missing_pkgs)
+    if [ -z "$pk" ]; then
+        info "系统依赖已齐全(curl jq bash ca-certificates)，跳过安装"
+        return 0
+    fi
+    info "安装系统依赖: $pk"
     
     case "$OS" in
         alpine)
-            apk update || { err "apk update 失败"; exit 1; }
-            apk add --no-cache bash curl ca-certificates openssl openrc jq || {
+            # shellcheck disable=SC2086
+            apk add --no-cache $pk || {
                 err "依赖安装失败"
                 exit 1
             }
@@ -134,13 +177,15 @@ install_deps() {
         debian)
             export DEBIAN_FRONTEND=noninteractive
             apt-get update -y || { err "apt update 失败"; exit 1; }
-            apt-get install -y curl ca-certificates openssl jq || {
+            # shellcheck disable=SC2086
+            apt-get install -y --no-install-recommends $pk || {
                 err "依赖安装失败"
                 exit 1
             }
             ;;
         redhat)
-            yum install -y curl ca-certificates openssl jq || {
+            # shellcheck disable=SC2086
+            yum install -y $pk || {
                 err "依赖安装失败"
                 exit 1
             }
@@ -311,6 +356,218 @@ validate_host() {
 }
 
 # -----------------------
+LANDING_CONFIG="/etc/sing-box/config.json"
+RELAY_CONFIG_FILE="/etc/sing-box-relay/config.json"
+# ===== NAT 模式（LXC/NAT 小鸡：商家只映射少数几个端口，入口IP ≠ 出口IP）=====
+# 落地机和线路机共用 /etc/sb-nat.conf：
+#   NAT_MODE=1/0  NAT_PORTS=商家映射端口  NAT_UDP_PORTS=其中也映射了 UDP 的端口  NAT_SSH_PORT=SSH 用的映射端口  ENTRY_IP=入口IP
+NAT_CONF="/etc/sb-nat.conf"
+NAT_MODE=0; NAT_PORTS=""; NAT_UDP_PORTS=""; NAT_SSH_PORT=""; ENTRY_IP=""
+NAT_USED=" "
+declare -A NAT_LABEL=()
+
+nat_load() {
+    NAT_MODE=0; NAT_PORTS=""; NAT_UDP_PORTS=""; NAT_SSH_PORT=""; ENTRY_IP=""
+    if [ -f "$NAT_CONF" ]; then
+        # shellcheck disable=SC1090
+        . "$NAT_CONF" 2>/dev/null || true
+    fi
+    return 0
+}
+
+nat_save() {
+    {
+        printf '# sb NAT 模式设置（落地机/线路机共用；sb 菜单「NAT 映射端口」「入口/出口 IP」里修改）\n'
+        printf 'NAT_MODE=%q\n' "$NAT_MODE"
+        printf 'NAT_PORTS=%q\n' "$NAT_PORTS"
+        printf 'NAT_UDP_PORTS=%q\n' "$NAT_UDP_PORTS"
+        printf 'NAT_SSH_PORT=%q\n' "$NAT_SSH_PORT"
+        printf 'ENTRY_IP=%q\n' "$ENTRY_IP"
+    } > "$NAT_CONF"
+    chmod 600 "$NAT_CONF" 2>/dev/null || true
+}
+
+nat_on() { [ "${NAT_MODE:-0}" = "1" ] && [ -n "${NAT_PORTS:-}" ]; }
+in_words() { [[ " $2 " == *" $1 "* ]]; }
+
+# 解析端口列表：逗号/空格分隔，支持范围 a-b（最多 256 个端口）；结果放 NAT_PARSED（升序去重）
+nat_parse_list() {
+    local item lo hi p out=""
+    for item in $(printf '%s' "$1" | tr ',，;' '   '); do
+        if [[ "$item" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            lo=$((10#${BASH_REMATCH[1]})); hi=$((10#${BASH_REMATCH[2]}))
+        elif [[ "$item" =~ ^[0-9]+$ ]]; then
+            lo=$((10#$item)); hi=$lo
+        else
+            return 1
+        fi
+        [ "$lo" -ge 1 ] && [ "$hi" -le 65535 ] && [ "$lo" -le "$hi" ] || return 1
+        [ $((hi - lo)) -le 256 ] || return 1
+        for ((p = lo; p <= hi; p++)); do out="$out $p"; done
+    done
+    NAT_PARSED=$(printf '%s\n' $out | sort -n -u | tr '\n' ' ' | sed 's/ *$//')
+    [ -n "$NAT_PARSED" ] && [ "$(printf '%s\n' $NAT_PARSED | wc -l)" -le 256 ]
+}
+
+# 某配置里各入站占用的 端口 网络 名称（SS=TCP+UDP，HY2/TUIC=UDP，其余=TCP）
+cfg_port_nets() {
+    [ -f "$1" ] && command -v jq >/dev/null 2>&1 || return 0
+    jq -r --arg who "$2" '(.inbounds // [])[] | select(.listen_port != null) | .listen_port as $p | (.tag // .type) as $t
+        | (if .type == "shadowsocks" then ["tcp","udp"] elif (.type == "hysteria2" or .type == "tuic") then ["udp"] else ["tcp"] end)[]
+        | "\($p) \(.) \($who):\($t)"' "$1" 2>/dev/null || true
+}
+
+# 收集已占用的 端口/网络：$@ = 配置文件（落地机/线路机）
+nat_collect_used() {
+    local f p n l who
+    NAT_USED=" "
+    NAT_LABEL=()
+    for f in "$@"; do
+        [ -f "$f" ] || continue
+        if [ "$f" = "$LANDING_CONFIG" ]; then who="落地机"; else who="线路机"; fi
+        while read -r p n l; do
+            [ -n "$p" ] || continue
+            NAT_USED="$NAT_USED$p/$n "
+            if [ "$n" = "udp" ] && [[ "${NAT_LABEL[$p]:-}" == *"$l(TCP)" ]]; then
+                NAT_LABEL[$p]="${NAT_LABEL[$p]%(TCP)}(TCP+UDP)"
+            else
+                NAT_LABEL[$p]="${NAT_LABEL[$p]:+${NAT_LABEL[$p]}, }$l($(printf '%s' "$n" | tr 'a-z' 'A-Z'))"
+            fi
+        done < <(cfg_port_nets "$f" "$who")
+    done
+}
+nat_mark() { NAT_USED="$NAT_USED$1/$2 "; }
+nat_used() { [[ "$NAT_USED" == *" $1/$2 "* ]]; }
+
+# 从映射端口里挑一个：$1 = tcp(VLESS/AnyTLS) | udp(HY2/TUIC，只用映射了 UDP 的端口) | ss(TCP+UDP)
+# 优先完全空闲的端口；TCP 协议优先不占用映射了 UDP 的端口（留给 HY2/TUIC）；不用 SSH 端口
+nat_pick() {
+    local need="$1" p score best="" bs=99
+    for p in $NAT_PORTS; do
+        [ "$p" = "${NAT_SSH_PORT:-}" ] && continue
+        score=0
+        case "$need" in
+            tcp)
+                nat_used "$p" tcp && continue
+                nat_used "$p" udp && score=$((score + 2))
+                in_words "$p" "$NAT_UDP_PORTS" && score=$((score + 1))
+                ;;
+            udp)
+                in_words "$p" "$NAT_UDP_PORTS" || continue
+                nat_used "$p" udp && continue
+                nat_used "$p" tcp && score=$((score + 2))
+                ;;
+            ss)
+                nat_used "$p" tcp && continue
+                nat_used "$p" udp && continue
+                in_words "$p" "$NAT_UDP_PORTS" && score=$((score + 1))
+                ;;
+        esac
+        if [ "$score" -lt "$bs" ]; then bs=$score; best=$p; fi
+    done
+    [ -n "$best" ] || return 1
+    printf '%s' "$best"
+}
+
+# 打印 映射端口 → 用途 表
+nat_table() {
+    local p maps use free=""
+    echo "   映射端口   商家映射      用途"
+    for p in $NAT_PORTS; do
+        maps="TCP"; in_words "$p" "$NAT_UDP_PORTS" && maps="TCP+UDP"
+        if [ "$p" = "${NAT_SSH_PORT:-}" ]; then
+            use="SSH(不能用)"
+        else
+            use="${NAT_LABEL[$p]:-}"
+            [ -z "$use" ] && { use="空闲"; free="$free $p"; }
+        fi
+        printf '   %-10s %-12s %s\n' "$p" "$maps" "$use"
+    done
+    echo "   剩余空闲映射端口:${free:- 无}"
+}
+
+# 本机 sshd 端口（检测不到为 22）
+detect_sshd_port() {
+    local p=""
+    p=$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}' || true)
+    [ -n "$p" ] || p=$(grep -Ei '^[[:space:]]*Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2; exit}' || true)
+    printf '%s' "${p:-22}"
+}
+
+# 交互输入 映射端口列表 / SSH 端口 / UDP 端口；$1=tcponly 时 UDP 回车默认沿用（线路机节点只用 TCP）
+# 环境变量: SINGBOX_NAT_PORTS SINGBOX_NAT_SSH_PORT SINGBOX_NAT_UDP(all|none|端口列表)
+nat_ask_ports() {
+    local in def sshd udp_in
+    echo ""
+    info "=== NAT 模式：填写商家映射给你的端口 ==="
+    echo "   NAT 小鸡只有商家映射的几个端口能从外网连进来（例如 56566,56567,56568 或 56566-56570）。"
+    echo "   脚本只会使用这些端口，自动给每个协议分配，不会碰 SSH 端口。"
+    def="${NAT_PORTS:-}"
+    in="${SINGBOX_NAT_PORTS:-}"
+    while true; do
+        if [ -z "$in" ]; then
+            read -r -p "商家映射端口列表${def:+(回车沿用 $def)}: " in || { err "没有读到输入，退出"; exit 1; }
+            in="${in:-$def}"
+        fi
+        if [ -n "$in" ] && nat_parse_list "$in"; then break; fi
+        err "端口列表格式不对: '${in}'（例: 56566,56567,56568 或 56566-56570，最多 256 个）"
+        in=""
+    done
+    NAT_PORTS="$NAT_PARSED"
+    sshd=$(detect_sshd_port)
+    def="${NAT_SSH_PORT:-}"
+    in_words "$def" "$NAT_PORTS" || def=""
+    if [ -z "$def" ] && in_words "$sshd" "$NAT_PORTS"; then def="$sshd"; fi
+    in="${SINGBOX_NAT_SSH_PORT-__ask__}"
+    while true; do
+        if [ "$in" = "__ask__" ]; then
+            echo "   本机 sshd 监听端口: $sshd。如果列表里有一个端口是商家给 SSH 用的(映射到本机 $sshd)，请填它；没有就输入 0。"
+            read -r -p "列表中的 SSH 端口${def:+(回车默认 $def)}: " in || { err "没有读到输入，退出"; exit 1; }
+            in="${in:-${def:-0}}"
+        fi
+        in=$(printf '%s' "$in" | tr -d '[:space:]')
+        if [ -z "$in" ] || [ "$in" = "0" ]; then NAT_SSH_PORT=""; break; fi
+        if in_words "$in" "$NAT_PORTS"; then NAT_SSH_PORT="$in"; break; fi
+        err "SSH 端口 $in 不在映射端口列表里"
+        in="__ask__"
+    done
+    def="${NAT_UDP_PORTS:-}"
+    udp_in="${SINGBOX_NAT_UDP:-}"
+    while true; do
+        if [ -z "$udp_in" ]; then
+            echo "   哪些端口商家也映射了 UDP？HY2/TUIC 只会放在映射了 UDP 的端口上（不确定就问商家，或填 none）。"
+            if [ -n "$def" ]; then
+                read -r -p "UDP 端口: all=全部 / none=没有 / 端口列表 (回车沿用 $def): " udp_in || { err "没有读到输入，退出"; exit 1; }
+                udp_in="${udp_in:-$def}"
+            else
+                read -r -p "UDP 端口: all=全部 / none=没有 / 端口列表 (回车默认 all): " udp_in || { err "没有读到输入，退出"; exit 1; }
+                udp_in="${udp_in:-all}"
+            fi
+        fi
+        case "$udp_in" in
+            all|ALL|All) NAT_UDP_PORTS="$NAT_PORTS"; break ;;
+            none|NONE|None|0) NAT_UDP_PORTS=""; break ;;
+        esac
+        if nat_parse_list "$udp_in"; then
+            local p ok=1 out=""
+            for p in $NAT_PARSED; do
+                if in_words "$p" "$NAT_PORTS"; then out="$out $p"; else err "UDP 端口 $p 不在映射端口列表里"; ok=0; fi
+            done
+            if [ "$ok" = 1 ]; then NAT_UDP_PORTS="${out# }"; break; fi
+        else
+            err "格式不对: '$udp_in'"
+        fi
+        udp_in=""
+    done
+    # SSH 端口不算可用的 UDP 端口
+    if [ -n "$NAT_SSH_PORT" ]; then
+        NAT_UDP_PORTS=$(printf '%s\n' $NAT_UDP_PORTS | grep -vx "$NAT_SSH_PORT" | tr '\n' ' ' | sed 's/ *$//' || true)
+    fi
+    info "映射端口: $NAT_PORTS | SSH: ${NAT_SSH_PORT:-无} | 映射了 UDP: ${NAT_UDP_PORTS:-无}"
+}
+
+
+# -----------------------
 # 工具函数
 # 生成随机端口
 rand_port() {
@@ -443,6 +700,81 @@ select_ss_method() {
 
 select_ss_method
 
+# openssl 只在需要时安装：HY2/TUIC 自签证书、Reality/AnyTLS 目标网站握手检查
+ensure_openssl() {
+    command -v openssl >/dev/null 2>&1 && return 0
+    info "安装 openssl（生成证书/检查 Reality 目标网站需要）..."
+    case "$OS" in
+        alpine) apk add --no-cache openssl >/dev/null 2>&1 || true ;;
+        debian) { DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openssl >/dev/null 2>&1 \
+                  || { apt-get update -y >/dev/null 2>&1 && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openssl >/dev/null 2>&1; }; } || true ;;
+        redhat) yum install -y openssl >/dev/null 2>&1 || true ;;
+    esac
+    command -v openssl >/dev/null 2>&1 || warn "openssl 安装失败"
+}
+if $ENABLE_HY2 || $ENABLE_TUIC || $ENABLE_REALITY || $ENABLE_ANYTLS; then
+    ensure_openssl
+fi
+
+# -----------------------
+# NAT 模式：容器 / 网卡是内网 IP 时建议开启（只用商家映射端口、自动分配、单独记录入口IP）
+# 环境变量 SINGBOX_NAT_MODE=1 强制开启，=0 强制关闭（不询问）；普通 VPS 不询问，与以前完全一样
+NAT_ON=false
+NAT_ASKED=false
+nat_decide() {
+    nat_load
+    local ans="${SINGBOX_NAT_MODE:-}" why="" l4
+    if [ -z "$ans" ]; then
+        l4=$(local_route_ip4)
+        [ "${IS_CONTAINER:-false}" = "true" ] && why="容器环境(${VIRT})"
+        if [ -n "$l4" ] && is_private_ipv4 "$l4"; then why="${why:+$why，}网卡是内网IP $l4"; fi
+        [ "${NAT_MODE:-0}" = "1" ] && why="${why:+$why，}上次安装开启过 NAT 模式"
+        [ -n "$why" ] || return 0
+        echo ""
+        warn "检测到: ${why}"
+        echo "   LXC/NAT 小鸡通常只有商家映射的几个端口(如 56566~56570)能从外网连进来，入口IP(商家面板里的公网IP)也和出口IP不同。"
+        echo "   开启 NAT 模式后：只用你填写的映射端口，自动给每个协议分配(HY2/TUIC 只放在映射了 UDP 的端口)，不碰 SSH 端口，"
+        echo "   并单独记录入口IP，所有链接都用它。Oracle/AWS 这类所有端口都能用的云服务器(1:1 NAT)选 n。"
+        read -r -p "是否开启 NAT 模式?(Y/n): " ans || ans=""
+        case "$ans" in [Nn]*) ans=0 ;; *) ans=1 ;; esac
+        NAT_ASKED=true
+    fi
+    if [ "$ans" = "1" ]; then
+        NAT_ON=true
+        info "已开启 NAT 模式"
+    fi
+}
+nat_decide
+
+# NAT 模式下的入口IP：显示出口IP和运营商，入口IP 必须由用户确认（存到 /etc/sb-nat.conf 和 CUSTOM_IP）
+nat_entry_ip() {
+    local def in
+    def=$(normalize_host "${ENTRY_IP:-$OLD_CUSTOM_IP}")
+    info "正在检测出口IP..."
+    detect_public_ip || true
+    echo ""
+    info "=== 入口IP 和 出口IP ==="
+    echo "   入口IP: 客户端/线路机连接本机用的地址 = 商家面板里的公网IP/域名（一般就是 SSH 登录用的 IP）"
+    echo "   出口IP: ${DETECTED_IP:-检测失败}${DETECTED_ORG:+  (${DETECTED_ORG})}  ← 本机访问外网时显示的 IP"
+    echo "   NAT 小鸡上两者不同是正常的：出口可能是商家提供的解锁出口(例如家宽 IP)，或 WARP。节点链接里只用入口IP。"
+    in="${SINGBOX_ENTRY_IP:-}"
+    while true; do
+        if [ -z "$in" ]; then
+            read -r -p "请输入入口IP/域名${def:+(回车使用 $def)}: " in || { err "没有读到输入，退出"; exit 1; }
+            in="${in:-$def}"
+        fi
+        in=$(normalize_host "$in")
+        if [ -n "$in" ] && validate_host "$in"; then break; fi
+        [ -n "$in" ] && err "地址无效: '${in}'（需为 IPv4、IPv6 或域名）"
+        [ -z "$in" ] && err "NAT 模式必须填写入口IP（商家面板里的公网IP/域名）"
+        in=""
+    done
+    ENTRY_IP="$in"
+    CUSTOM_IP="$in"
+    [ -n "$DETECTED_IP" ] && [ "$DETECTED_IP" != "$in" ] && info "入口IP $in ≠ 出口IP $DETECTED_IP（NAT 上正常）"
+    return 0
+}
+
 # -----------------------
 # 在获取公网 IP 之前，询问连接ip和sni配置
 # 节点连接地址：留空时自动检测；检测到 NAT/WARP 时不自动填，必须由用户输入入口地址
@@ -453,6 +785,9 @@ if [ -f /etc/sing-box/.config_cache ]; then
     OLD_CUSTOM_IP=$( (. /etc/sing-box/.config_cache >/dev/null 2>&1; printf '%s' "${CUSTOM_IP:-}") || true)
 fi
 DETECTED_IP=""; DETECTED_FAMILY=""; DETECTED_ORG=""; NAT_REASON=""
+if $NAT_ON; then
+    nat_entry_ip
+else
 echo ""
 if [ -n "$OLD_CUSTOM_IP" ]; then
     echo "请输入节点连接 IP 或 DDNS域名(回车使用上次保存的 ${OLD_CUSTOM_IP}):"
@@ -483,6 +818,7 @@ while true; do
     read -r CUSTOM_IP || { err "没有读到输入，退出"; exit 1; }
     CUSTOM_IP="$(echo "$CUSTOM_IP" | tr -d '[:space:]')"
 done
+fi
 
 # -----------------------
 # Reality 目标网站(SNI)检查：只警告，不阻止
@@ -679,7 +1015,13 @@ port_busy_os() {
 
 # 随机挑一个可用端口：有商家端口范围时只在范围内挑
 pick_random_port() {
-    local nets="$1" p r lo hi
+    local nets="$1" p r lo hi mode=tcp
+    if $NAT_ON; then
+        [ "$nets" = "udp" ] && mode=udp
+        [ "$nets" = "tcp udp" ] && mode=ss
+        nat_pick "$mode"
+        return $?
+    fi
     for _ in $(seq 1 300); do
         if [ "${#NAT_RANGES[@]}" -gt 0 ]; then
             r="${NAT_RANGES[$((RANDOM % ${#NAT_RANGES[@]}))]}"
@@ -699,7 +1041,9 @@ pick_random_port() {
 # 询问某协议端口：$1=协议名 $2=环境变量给定的端口(可空) $3=网络("tcp"/"udp"/"tcp udp")；结果 CHOSEN_PORT
 ask_proto_port() {
     local label="$1" envval="$2" nets="$3" p ans hint conflict n
-    if [ "${#NAT_RANGES[@]}" -gt 0 ]; then
+    if $NAT_ON; then
+        hint="留空则从映射端口中自动选；SSH 端口 ${NAT_SSH_PORT:-无} 不能用"
+    elif [ "${#NAT_RANGES[@]}" -gt 0 ]; then
         hint="留空则从商家端口范围 ${NAT_PORT_RANGE} 中随机"
     else
         hint="留空则随机 10000-60000"
@@ -726,12 +1070,21 @@ ask_proto_port() {
                 err "端口 $p 已被 ${conflict} 使用，请换一个"
                 continue
             fi
+            if $NAT_ON && [ "$p" = "${NAT_SSH_PORT:-}" ]; then
+                err "端口 $p 是 SSH 用的映射端口，不能用"
+                continue
+            fi
+            if $NAT_ON && [ "$nets" = "udp" ] && in_words "$p" "$NAT_PORTS" && ! in_words "$p" "$NAT_UDP_PORTS"; then
+                warn "端口 $p 没有映射 UDP（你填写的 UDP 端口: ${NAT_UDP_PORTS:-无}），${label} 用 UDP，外网连不上"
+                read -r -p "仍然使用 $p ?(y/N): " ans || ans=""
+                [[ "$ans" =~ ^[Yy]$ ]] || continue
+            fi
             if [ "${#NAT_RANGES[@]}" -gt 0 ] && ! port_in_ranges "$p"; then
                 warn "端口 $p 不在你填写的商家端口范围(${NAT_PORT_RANGE})内，NAT 机器上外网很可能连不上"
                 read -r -p "仍然使用 $p ?(y/N): " ans || ans=""
                 [[ "$ans" =~ ^[Yy]$ ]] || continue
             fi
-            if port_busy_os "$p" "$nets"; then
+            if port_busy_os "$p" "$nets" && ! { $NAT_ON && old_landing_port "$p"; }; then
                 warn "端口 $p 已被本机程序占用（如果是旧的 sing-box 占用，重装后会自动释放，可以继续）"
                 read -r -p "仍然使用 $p ?(y/N): " ans || ans=""
                 [[ "$ans" =~ ^[Yy]$ ]] || continue
@@ -741,13 +1094,120 @@ ask_proto_port() {
     done
     for n in $nets; do
         if [ "$n" = "tcp" ]; then USED_TCP[$p]="$label"; else USED_UDP[$p]="$label"; fi
+        nat_mark "$p" "$n"
     done
     CHOSEN_PORT="$p"
 }
 
+# 端口是否写在本机旧的落地机配置里（重装时这些端口会被释放，不算占用）
+old_landing_port() {
+    [ -f "$LANDING_CONFIG" ] && command -v jq >/dev/null 2>&1 \
+        && jq -e --argjson p "$1" 'any((.inbounds // [])[]; .listen_port == $p)' "$LANDING_CONFIG" >/dev/null 2>&1
+}
+
+# NAT 模式：按协议自动分配映射端口。结果 NAT_A_<协议>（nat_auto 间接读取），放不下的协议在 NAT_UNPLACED
+# shellcheck disable=SC2034
+nat_assign() {
+    local p
+    nat_collect_used "$RELAY_CONFIG_FILE"
+    NAT_UNPLACED=""
+    NAT_A_SS=""; NAT_A_HY2=""; NAT_A_TUIC=""; NAT_A_REALITY=""; NAT_A_ANYTLS=""
+    # 先放只能用 UDP 的 HY2/TUIC，再放 SS(TCP+UDP)，最后 Reality/AnyTLS(TCP)
+    if $ENABLE_HY2; then
+        if p=$(nat_pick udp); then NAT_A_HY2=$p; nat_mark "$p" udp; NAT_LABEL[$p]="${NAT_LABEL[$p]:+${NAT_LABEL[$p]}, }HY2(UDP)"; else NAT_UNPLACED="$NAT_UNPLACED HY2"; fi
+    fi
+    if $ENABLE_TUIC; then
+        if p=$(nat_pick udp); then NAT_A_TUIC=$p; nat_mark "$p" udp; NAT_LABEL[$p]="${NAT_LABEL[$p]:+${NAT_LABEL[$p]}, }TUIC(UDP)"; else NAT_UNPLACED="$NAT_UNPLACED TUIC"; fi
+    fi
+    if $ENABLE_SS; then
+        if p=$(nat_pick ss); then
+            NAT_A_SS=$p; nat_mark "$p" tcp; nat_mark "$p" udp
+            if in_words "$p" "$NAT_UDP_PORTS"; then NAT_LABEL[$p]="SS(TCP+UDP)"; else NAT_LABEL[$p]="SS(TCP，UDP 未映射)"; fi
+        else NAT_UNPLACED="$NAT_UNPLACED SS"; fi
+    fi
+    if $ENABLE_REALITY; then
+        if p=$(nat_pick tcp); then NAT_A_REALITY=$p; nat_mark "$p" tcp; NAT_LABEL[$p]="${NAT_LABEL[$p]:+${NAT_LABEL[$p]}, }VLESS Reality(TCP)"; else NAT_UNPLACED="$NAT_UNPLACED Reality"; fi
+    fi
+    if $ENABLE_ANYTLS; then
+        if p=$(nat_pick tcp); then NAT_A_ANYTLS=$p; nat_mark "$p" tcp; NAT_LABEL[$p]="${NAT_LABEL[$p]:+${NAT_LABEL[$p]}, }AnyTLS(TCP)"; else NAT_UNPLACED="$NAT_UNPLACED AnyTLS"; fi
+    fi
+    NAT_UNPLACED="${NAT_UNPLACED# }"
+}
+
+# 去掉放不下的协议
+nat_drop_protocols() {
+    local x
+    for x in $1; do
+        case "$x" in
+            SS) ENABLE_SS=false ;; HY2) ENABLE_HY2=false ;; TUIC) ENABLE_TUIC=false ;;
+            Reality) ENABLE_REALITY=false ;; AnyTLS) ENABLE_ANYTLS=false ;;
+        esac
+    done
+    cat > /etc/sing-box/.protocols <<PROTO
+ENABLE_SS=$ENABLE_SS
+ENABLE_HY2=$ENABLE_HY2
+ENABLE_TUIC=$ENABLE_TUIC
+ENABLE_REALITY=$ENABLE_REALITY
+ENABLE_ANYTLS=$ENABLE_ANYTLS
+PROTO
+    info "已去掉: $1"
+}
+
+# NAT 模式：填写映射端口 → 自动分配 → 显示 端口→协议 表 → 确认
+NAT_MANUAL=false
+nat_ports_flow() {
+    local ans
+    nat_ask_ports
+    while true; do
+        NAT_PORT_RANGE=$(printf '%s' "$NAT_PORTS" | tr ' ' ',')
+        parse_port_ranges "$NAT_PORT_RANGE" || true
+        nat_assign
+        if [ -n "$NAT_UNPLACED" ]; then
+            echo ""
+            warn "映射端口不够用：${NAT_UNPLACED} 没有可用的端口（HY2/TUIC 只能放在映射了 UDP 的端口；SSH 端口不会用）"
+            if ! $ENABLE_SS && ! $ENABLE_HY2 && ! $ENABLE_TUIC && ! $ENABLE_REALITY && ! $ENABLE_ANYTLS; then
+                err "没有选择任何协议"; exit 1
+            fi
+            read -r -p "回车 = 去掉 ${NAT_UNPLACED} 继续安装 / r = 重新填写映射端口 / n = 退出: " ans || ans=n
+            case "$ans" in
+                [Rr]*) unset SINGBOX_NAT_PORTS SINGBOX_NAT_UDP SINGBOX_NAT_SSH_PORT; nat_ask_ports; continue ;;
+                [Nn]*) info "已退出，没有改动"; exit 1 ;;
+                *)
+                    nat_drop_protocols "$NAT_UNPLACED"
+                    if ! $ENABLE_SS && ! $ENABLE_HY2 && ! $ENABLE_TUIC && ! $ENABLE_REALITY && ! $ENABLE_ANYTLS; then
+                        err "去掉之后没有可安装的协议了，请补充映射端口后重新运行"; exit 1
+                    fi
+                    continue
+                    ;;
+            esac
+        fi
+        echo ""
+        info "=== NAT 模式端口分配（只用映射端口）==="
+        nat_table
+        read -r -p "确认按此分配?(回车/Y = 确认 / m = 手动指定每个协议的端口 / r = 重新填写映射端口 / n = 取消安装): " ans || ans=""
+        case "$ans" in
+            [Mm]*) NAT_MANUAL=true; nat_collect_used "$RELAY_CONFIG_FILE"; break ;;
+            [Rr]*) unset SINGBOX_NAT_PORTS SINGBOX_NAT_UDP SINGBOX_NAT_SSH_PORT; nat_ask_ports ;;
+            [Nn]*) info "已取消安装，没有改动"; exit 1 ;;
+            *) break ;;
+        esac
+    done
+}
+
 udp_reminder() {
+    if $NAT_ON && in_words "$2" "$NAT_UDP_PORTS"; then
+        info "$1 使用映射了 UDP 的端口 $2（你已确认商家映射了 UDP）"
+        return 0
+    fi
     warn "$1 使用 UDP 端口 $2：NAT 机器必须确认商家把这个端口的【UDP】也映射了（很多 NAT 只映射 TCP），"
     warn "   云厂商安全组/防火墙也要放行 UDP $2，否则 $1 连不上。"
+}
+
+# NAT 模式自动分配的端口（手动模式或非 NAT 模式为空，此时会询问）
+nat_auto() {
+    $NAT_ON && ! $NAT_MANUAL || return 0
+    local v="NAT_A_$1"
+    printf '%s' "${!v:-}"
 }
 
 # -----------------------
@@ -755,26 +1215,29 @@ udp_reminder() {
 get_config() {
     info "开始配置端口和密码..."
 
-    # NAT 模式：商家只给了一段端口时，随机端口只在这段范围里挑
-    NAT_PORT_RANGE="${SINGBOX_NAT_PORTS:-}"
-    if [ -z "$NAT_PORT_RANGE" ]; then
+    if $NAT_ON; then
+        nat_ports_flow
+    fi
+    # 端口范围模式(旧)：商家只给了一段端口时，随机端口只在这段范围里挑（NAT 模式下已用上面的映射端口列表）
+    $NAT_ON || NAT_PORT_RANGE="${SINGBOX_NAT_PORTS:-}"
+    if ! $NAT_ON && [ -z "$NAT_PORT_RANGE" ]; then
         echo ""
         echo "如果这是 NAT 机器(商家只给了部分端口，例如 56566-56586)，请输入商家给的端口范围，脚本只在其中随机选端口。"
         echo "多个范围/端口用逗号分隔，例如: 56566-56586 或 20001,20002,20003 。普通 VPS 直接回车跳过。"
         read -r -p "商家端口范围(回车跳过): " NAT_PORT_RANGE || NAT_PORT_RANGE=""
     fi
-    while [ -n "$NAT_PORT_RANGE" ] && ! parse_port_ranges "$NAT_PORT_RANGE"; do
+    while ! $NAT_ON && [ -n "$NAT_PORT_RANGE" ] && ! parse_port_ranges "$NAT_PORT_RANGE"; do
         err "端口范围格式不对: '$NAT_PORT_RANGE'（例: 56566-56586 或 20001,20002）"
         read -r -p "商家端口范围(回车跳过): " NAT_PORT_RANGE || NAT_PORT_RANGE=""
     done
-    if [ -n "$NAT_PORT_RANGE" ]; then
-        info "NAT 模式：随机端口只从 ${NAT_PORT_RANGE} 中选择"
+    if ! $NAT_ON && [ -n "$NAT_PORT_RANGE" ]; then
+        info "端口范围模式：随机端口只从 ${NAT_PORT_RANGE} 中选择"
         info "提示：Reality/AnyTLS(TCP) 和 HY2/TUIC(UDP) 可以使用同一个端口号；SS 同时占用该端口的 TCP 和 UDP"
     fi
 
     if $ENABLE_SS; then
         info "=== 配置 Shadowsocks (SS) ==="
-        ask_proto_port "SS" "${SINGBOX_PORT_SS:-}" "tcp udp"
+        ask_proto_port "SS" "${SINGBOX_PORT_SS:-$(nat_auto SS)}" "tcp udp"
         PORT_SS="$CHOSEN_PORT"
         PSK_SS=$(rand_pass)
         info "SS 端口: $PORT_SS (TCP+UDP)"
@@ -784,7 +1247,7 @@ get_config() {
 
     if $ENABLE_HY2; then
         info "=== 配置 Hysteria2 (HY2) ==="
-        ask_proto_port "HY2" "${SINGBOX_PORT_HY2:-}" "udp"
+        ask_proto_port "HY2" "${SINGBOX_PORT_HY2:-$(nat_auto HY2)}" "udp"
         PORT_HY2="$CHOSEN_PORT"
         PSK_HY2=$(rand_pass)
         info "HY2 端口: $PORT_HY2 (UDP)"
@@ -794,7 +1257,7 @@ get_config() {
 
     if $ENABLE_TUIC; then
         info "=== 配置 TUIC ==="
-        ask_proto_port "TUIC" "${SINGBOX_PORT_TUIC:-}" "udp"
+        ask_proto_port "TUIC" "${SINGBOX_PORT_TUIC:-$(nat_auto TUIC)}" "udp"
         PORT_TUIC="$CHOSEN_PORT"
         PSK_TUIC=$(rand_pass)
         UUID_TUIC=$(rand_uuid)
@@ -805,7 +1268,7 @@ get_config() {
 
     if $ENABLE_REALITY; then
         info "=== 配置 VLESS Reality ==="
-        ask_proto_port "VLESS Reality" "${SINGBOX_PORT_REALITY:-}" "tcp"
+        ask_proto_port "VLESS Reality" "${SINGBOX_PORT_REALITY:-$(nat_auto REALITY)}" "tcp"
         PORT_REALITY="$CHOSEN_PORT"
         UUID=$(rand_uuid)
         info "VLESS Reality 端口: $PORT_REALITY (TCP)"
@@ -814,10 +1277,10 @@ get_config() {
 
     if $ENABLE_ANYTLS; then
         info "=== 配置 AnyTLS Reality ==="
-        ask_proto_port "AnyTLS Reality" "${SINGBOX_PORT_ANYTLS:-}" "tcp"
+        ask_proto_port "AnyTLS Reality" "${SINGBOX_PORT_ANYTLS:-$(nat_auto ANYTLS)}" "tcp"
         PORT_ANYTLS="$CHOSEN_PORT"
-        ANYTLS_USER=$(openssl rand -hex 4)
-        ANYTLS_PSK=$(openssl rand -base64 16)
+        ANYTLS_USER=$(openssl rand -hex 4 2>/dev/null || head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n')
+        ANYTLS_PSK=$(rand_pass)
         info "AnyTLS Reality 端口: $PORT_ANYTLS (TCP)"
         info "AnyTLS Reality 用户名: $ANYTLS_USER"
         info "AnyTLS Reality 密码已自动生成"
@@ -836,24 +1299,30 @@ install_singbox() {
     if command -v sing-box >/dev/null 2>&1; then
         CURRENT_VERSION=$(sing-box version 2>/dev/null | head -1 || echo "unknown")
         warn "检测到已安装 sing-box: $CURRENT_VERSION"
-        read -p "是否重新安装?(y/N): " REINSTALL
-        if [[ ! "$REINSTALL" =~ ^[Yy]$ ]]; then
-            info "跳过 sing-box 安装"
-            return 0
+        local have
+        have=$(sb_version)
+        if [ -n "$have" ] && ! ver_ge "$have" "$SB_MIN_VER"; then
+            warn "已安装的 sing-box $have 低于本次所选协议需要的 $SB_MIN_VER（AnyTLS 需要 1.12，HY2 的 BBR 设置需要 1.11）"
+            read -r -p "是否重新安装新版?(Y/n): " REINSTALL || REINSTALL=""
+            [[ "$REINSTALL" =~ ^[Nn]$ ]] && { warn "继续使用 $have，可能出现配置校验失败"; return 0; }
+        else
+            read -p "是否重新安装?(y/N): " REINSTALL
+            if [[ ! "$REINSTALL" =~ ^[Yy]$ ]]; then
+                info "跳过 sing-box 安装"
+                return 0
+            fi
         fi
     fi
 
     case "$OS" in
         alpine)
-            info "使用 Edge 仓库安装 sing-box"
-            apk update || { err "apk update 失败"; exit 1; }
-            apk add --repository=http://dl-cdn.alpinelinux.org/alpine/edge/community sing-box || {
+            install_singbox_alpine "$SB_MIN_VER" || {
                 err "sing-box 安装失败"
                 exit 1
             }
             ;;
         debian|redhat)
-            bash <(curl -fsSL https://sing-box.app/install.sh) || {
+            (cd "$(mktemp -d)" && bash <(curl -fsSL https://sing-box.app/install.sh)) || {
                 err "sing-box 安装失败"
                 exit 1
             }
@@ -872,6 +1341,60 @@ install_singbox() {
     INSTALLED_VERSION=$(sing-box version 2>/dev/null | head -1 || echo "unknown")
     info "sing-box 安装成功: $INSTALLED_VERSION"
 }
+
+# ===== 安装 sing-box：Alpine 优先官方仓库，版本太旧/没有时从 GitHub 下载官方二进制，再不行用 edge 仓库 =====
+SB_MIN_VER="1.11.0"   # hysteria2 ignore_client_bandwidth 需要 1.11；AnyTLS 需要 1.12（落地机安装时会提高要求）
+ver_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -t. -k1,1n -k2,2n -k3,3n | head -n1)" = "$2" ]; }
+sb_version() { sing-box version 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true; }
+sb_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64) echo amd64 ;; aarch64|arm64) echo arm64 ;; armv7*) echo armv7 ;; armv6*) echo armv6 ;;
+        i?86) echo 386 ;; s390x) echo s390x ;; riscv64) echo riscv64 ;; *) return 1 ;;
+    esac
+}
+install_singbox_github() {
+    local arch ver tmp dir v variants
+    arch=$(sb_arch) || { err "不支持的 CPU 架构: $(uname -m)"; return 1; }
+    ver=$(curl -fsSI --max-time 15 https://github.com/SagerNet/sing-box/releases/latest 2>/dev/null | tr -d '\r' \
+        | awk 'tolower($1)=="location:"{n=split($2,a,"/"); print a[n]}' | sed 's/^v//' || true)
+    [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { warn "获取 GitHub 上 sing-box 最新版本失败"; return 1; }
+    # Alpine(musl) 先用 -musl 版本；其他系统先用默认版本；下载后先运行一次确认能用，才替换现有程序
+    if ls /lib/ld-musl-* >/dev/null 2>&1; then variants="musl plain"; else variants="plain glibc"; fi
+    tmp=$(mktemp -d)
+    for v in $variants; do
+        if [ "$v" = "plain" ]; then v=""; else v="-$v"; fi
+        dir="sing-box-${ver}-linux-${arch}${v}"
+        info "从 GitHub 下载 sing-box ${ver}（官方程序 ${arch}${v}）..."
+        rm -rf "${tmp:?}"/*
+        if curl -fsSL --max-time 300 -o "$tmp/sb.tgz" "https://github.com/SagerNet/sing-box/releases/download/v${ver}/${dir}.tar.gz" \
+            && tar -xzf "$tmp/sb.tgz" -C "$tmp" && [ -f "$tmp/$dir/sing-box" ] && "$tmp/$dir/sing-box" version >/dev/null 2>&1; then
+            cp "$tmp/$dir/sing-box" /usr/bin/sing-box.new && chmod 755 /usr/bin/sing-box.new && mv -f /usr/bin/sing-box.new /usr/bin/sing-box
+            rm -rf "$tmp"
+            return 0
+        fi
+    done
+    rm -rf "$tmp" /usr/bin/sing-box.new
+    warn "从 GitHub 下载 sing-box 失败(或下载的程序在本机无法运行)"
+    return 1
+}
+# $1 = 最低版本
+install_singbox_alpine() {
+    local need="${1:-$SB_MIN_VER}" repo
+    repo=$(apk --no-cache search -x sing-box 2>/dev/null | sed -n 's/^sing-box-\([0-9][0-9.]*\)-r[0-9]*$/\1/p' | head -n1 || true)
+    if [ -n "$repo" ] && ver_ge "$repo" "$need"; then
+        info "使用 Alpine 官方仓库的 sing-box $repo"
+        apk add --no-cache sing-box && return 0
+    elif [ -n "$repo" ]; then
+        warn "Alpine 官方仓库的 sing-box 是 $repo，低于本脚本需要的 $need，改从 GitHub 下载"
+    else
+        info "当前 Alpine 版本的官方仓库没有 sing-box，改从 GitHub 下载"
+    fi
+    install_singbox_github && return 0
+    warn "改用 Alpine edge 仓库安装 sing-box"
+    apk add --no-cache --repository=http://dl-cdn.alpinelinux.org/alpine/edge/community sing-box
+}
+# 本次所选协议需要的最低 sing-box 版本：AnyTLS 1.12，其余 1.11（HY2 ignore_client_bandwidth）
+$ENABLE_ANYTLS && SB_MIN_VER="1.12.0"
 
 # -----------------------
 # 纯 IPv6 机器：GitHub 等不支持 IPv6，sing-box 官方安装脚本会下载失败
@@ -1305,6 +1828,16 @@ CACHEEOF
 # 调用配置生成
 create_config
 
+# NAT 模式设置保存到 /etc/sb-nat.conf（落地机/线路机共用）；拒绝 NAT 模式时记录为关闭
+if $NAT_ON; then
+    NAT_MODE=1
+    nat_save
+    info "NAT 模式设置已保存到 $NAT_CONF（映射端口: $NAT_PORTS，入口IP: $ENTRY_IP）"
+elif $NAT_ASKED && [ -f "$NAT_CONF" ]; then
+    NAT_MODE=0
+    nat_save
+fi
+
 info "配置生成完成，准备设置服务..."
 
 # -----------------------
@@ -1591,6 +2124,13 @@ $ENABLE_REALITY && echo "   Reality 端口: $PORT_REALITY | UUID: $UUID"
 $ENABLE_ANYTLS && echo "   AnyTLS 端口: $PORT_ANYTLS | 用户: $ANYTLS_USER | 密码: $ANYTLS_PSK"
 echo "   服务器: $PUB_IP"
 echo "   Reality server_name(SNI): ${REALITY_SNI:-addons.mozilla.org}"
+if $NAT_ON; then
+    echo ""
+    info "🔌 NAT 模式 映射端口 → 协议:"
+    nat_collect_used "$CONFIG_PATH" "$RELAY_CONFIG_FILE"
+    nat_table
+    echo "   入口IP(链接里用): $ENTRY_IP | 出口IP: ${DETECTED_IP:-未检测}${DETECTED_ORG:+ ($DETECTED_ORG)}"
+fi
 echo ""
 info "📂 文件位置:"
 echo "   配置: $CONFIG_PATH"
@@ -1641,6 +2181,20 @@ SERVICE_NAME="sing-box"
 # 本机的线路机(中转/直连)节点：独立目录 + 独立服务 sing-box-relay，与上面的落地机节点互不覆盖
 RELAY_HOME="/etc/sing-box-relay"
 RELAY_SELF="$RELAY_HOME/relay-install.sh"
+# NAT 模式设置（落地机/线路机共用）：NAT_MODE NAT_PORTS NAT_UDP_PORTS NAT_SSH_PORT ENTRY_IP
+NAT_CONF="/etc/sb-nat.conf"
+
+# 读取 NAT 设置（只读取这几个变量，不影响其他变量）
+sb_nat_load() {
+    NAT_MODE=0; NAT_PORTS=""; NAT_UDP_PORTS=""; NAT_SSH_PORT=""; ENTRY_IP=""
+    if [ -f "$NAT_CONF" ]; then
+        # shellcheck disable=SC1090
+        . "$NAT_CONF" 2>/dev/null || true
+    fi
+    return 0
+}
+sb_nat_on() { [ "${NAT_MODE:-0}" = "1" ] && [ -n "${NAT_PORTS:-}" ]; }
+sb_in_words() { [[ " $2 " == *" $1 "* ]]; }
 
 # 检测系统
 detect_os() {
@@ -1901,6 +2455,12 @@ resolve_link_ip() {
         PUBLIC_IP=$(uri_host "$CUSTOM_IP")
         return 0
     fi
+    # NAT 模式记录的入口IP（sb「入口/出口 IP」里设置）
+    sb_nat_load
+    if [ -n "${ENTRY_IP:-}" ]; then
+        PUBLIC_IP=$(uri_host "$ENTRY_IP")
+        return 0
+    fi
     if detect_public_ip && [ -z "$NAT_REASON" ]; then
         PUBLIC_IP=$(uri_host "$DETECTED_IP")
         return 0
@@ -2106,21 +2666,59 @@ action_edit_config() {
 }
 
 # 端口是否已被本机线路机节点(sing-box-relay)使用
+# $2(可选) = 新端口要用的网络 "tcp" / "udp" / "tcp udp"：给出时只在网络重叠时算冲突（TCP 和 UDP 可以共用同一个端口号）
 relay_port_taken() {
-    [ -f "$RELAY_HOME/config.json" ] && jq -e --argjson p "$1" 'any((.inbounds // [])[]; .listen_port == $p)' "$RELAY_HOME/config.json" >/dev/null 2>&1
+    [ -f "$RELAY_HOME/config.json" ] || return 1
+    if [ -z "${2:-}" ]; then
+        jq -e --argjson p "$1" 'any((.inbounds // [])[]; .listen_port == $p)' "$RELAY_HOME/config.json" >/dev/null 2>&1
+        return $?
+    fi
+    port_nets_overlap "$RELAY_HOME/config.json" "$1" "$2"
 }
 
-# 新端口校验：数字 1-65535，且不能和本机线路机节点冲突
+# 配置文件 $1 里端口 $2 的入站使用的网络是否和 $3 重叠（SS=TCP+UDP，HY2/TUIC=UDP，其余=TCP）
+port_nets_overlap() {
+    local n used
+    [ -f "$1" ] || return 1
+    used=$(jq -r --argjson p "$2" '(.inbounds // [])[] | select(.listen_port == $p)
+        | (if .type == "shadowsocks" then "tcp udp" elif (.type == "hysteria2" or .type == "tuic") then "udp" else "tcp" end)' "$1" 2>/dev/null | tr '\n' ' ' || true)
+    for n in $3; do
+        [[ " $used " == *" $n "* ]] && return 0
+    done
+    return 1
+}
+
+# 新端口校验：数字 1-65535，且不能和本机线路机节点冲突；$2(可选) = 网络，见 relay_port_taken
 check_new_port() {
     if ! validate_port "$1"; then
         err "端口无效: $1（需为 1-65535 的数字）"
         return 1
     fi
-    if relay_port_taken "$1"; then
+    if relay_port_taken "$1" "${2:-}"; then
         err "端口 $1 已被本机的线路机节点(sing-box-relay，$RELAY_HOME/config.json)使用，请换一个"
         return 1
     fi
+    sb_nat_load
+    if sb_nat_on; then
+        if [ "$((10#$1))" = "${NAT_SSH_PORT:-}" ]; then
+            err "端口 $1 是 SSH 用的映射端口，不能用"
+            return 1
+        fi
+        if ! sb_in_words "$((10#$1))" "$NAT_PORTS"; then
+            local ans
+            warn "NAT 模式：端口 $1 不在商家映射端口($NAT_PORTS)里，外网很可能连不上"
+            read -r -p "仍然使用 $1 ?(y/N): " ans || ans=""
+            [[ "$ans" =~ ^[Yy]$ ]] || return 1
+        fi
+    fi
     return 0
+}
+
+# NAT 模式下给新端口提示：$1 = tcp|udp|ss，打印建议端口（没有返回 1）
+nat_suggest_port() {
+    sb_nat_load
+    sb_nat_on || return 1
+    run_relay_template natpick "$1" 2>/dev/null
 }
 
 # 重置SS端口
@@ -2267,7 +2865,15 @@ action_reset_anytls() {
 action_update() {
     info "开始更新 sing-box..."
     if [ "$OS" = "alpine" ]; then
-        apk update && apk upgrade sing-box || bash <(curl -fsSL https://sing-box.app/install.sh)
+        # 优先 Alpine 官方仓库(只在版本够新时)，否则从 GitHub 下载官方静态版本，再不行用 edge 仓库
+        local need="1.11.0"
+        [ "${ENABLE_ANYTLS:-false}" = "true" ] && need="1.12.0"
+        if apk info -e sing-box >/dev/null 2>&1 && apk upgrade --no-cache sing-box >/dev/null 2>&1 \
+            && [ "$(printf '%s\n%s\n' "$need" "$(sing-box version 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)" | sort -t. -k1,1n -k2,2n -k3,3n | head -n1)" = "$need" ]; then
+            info "已从 Alpine 仓库更新"
+        else
+            run_relay_template sbinstall "$need" || { err "更新 sing-box 失败"; return 1; }
+        fi
     else
         bash <(curl -fsSL https://sing-box.app/install.sh) || {
             err "下载 sing-box 失败"
@@ -2327,7 +2933,7 @@ action_uninstall() {
         info "已保留线路机节点和 sing-box 程序；sb 已换成线路机快捷菜单"
         bash "$RELAY_SELF" shortcut >/dev/null 2>&1 || true
     else
-        rm -f /usr/bin/sing-box 2>/dev/null || true
+        rm -f /usr/bin/sing-box "$NAT_CONF" 2>/dev/null || true
         if [ -L /usr/bin/sb ] && [ ! -e /usr/bin/sb ]; then rm -f /usr/bin/sb; fi
     fi
     # 本机已没有任何 sing-box 节点时，删除日志清理脚本/定时任务/journald 设置
@@ -2357,7 +2963,7 @@ relay_prepare() {
         run_relay_template upgrade || return 1
     fi
     if [ -f "$RELAY_HOME/relay.env" ] && { [ ! -f "$RELAY_SELF" ] || ! grep -q 'SVC_NAME="sing-box-relay"' "$RELAY_SELF" 2>/dev/null \
-        || ! grep -q 'sb-logrotate' "$RELAY_SELF" 2>/dev/null; }; then
+        || ! grep -q 'sb-logrotate' "$RELAY_SELF" 2>/dev/null || ! grep -q 'NAT_CONF=' "$RELAY_SELF" 2>/dev/null; }; then
         mkdir -p "$RELAY_HOME"
         write_relay_template "$RELAY_SELF"
         chmod 700 "$RELAY_SELF"
@@ -2495,11 +3101,13 @@ landing_valid() {
 
 # 端口是否已被系统占用（检测不到工具时视为未占用）
 port_in_use() {
-    local addrs=""
+    local addrs="" fl="-lntu"
+    # NAT 模式映射端口少：线路机节点只用 TCP，只看 TCP 占用（UDP 可以留给 HY2/TUIC 共用同一端口号）
+    nat_on && fl="-lnt"
     if command -v ss >/dev/null 2>&1; then
-        addrs=$(ss -lntu 2>/dev/null | awk 'NR>1{print $5}' || true)
+        addrs=$(ss "$fl" 2>/dev/null | awk 'NR>1{print $5}' || true)
     elif command -v netstat >/dev/null 2>&1; then
-        addrs=$(netstat -lntu 2>/dev/null | awk '{print $4}' || true)
+        addrs=$(netstat "$fl" 2>/dev/null | awk '{print $4}' || true)
     fi
     printf '%s\n' "$addrs" | grep -qE "[:.]$1\$"
 }
@@ -2519,6 +3127,19 @@ landing_port() { cfg_has_port "$LANDING_CONFIG" "$1"; }
 # 随机挑一个空闲端口：$1=需避开的端口(空格分隔) $2=strict(配置里已有的端口也避开)
 rand_free_port() {
     local avoid=" ${1:-} " strict="${2:-}" p i
+    nat_load
+    if nat_on; then
+        # NAT 模式：只从商家映射端口里选（不用 SSH 端口、不和落地机/线路机已有节点冲突）
+        if [ -n "$strict" ]; then nat_collect_used "$LANDING_CONFIG" "$CONFIG"; else nat_collect_used "$LANDING_CONFIG"; fi
+        for p in $avoid; do nat_mark "$p" tcp; nat_mark "$p" udp; done
+        for i in $NAT_PORTS; do
+            p=$(nat_pick tcp) || return 1
+            if port_in_use "$p" && ! own_port "$p"; then nat_mark "$p" tcp; continue; fi
+            echo "$p"
+            return 0
+        done
+        return 1
+    fi
     for i in $(seq 1 100); do
         p=$(shuf -i 20000-65000 -n 1 2>/dev/null || echo $(( (RANDOM % 45000) + 20000 )))
         [[ "$avoid" == *" $p "* ]] && continue
@@ -2534,18 +3155,42 @@ rand_free_port() {
 # 询问端口：$1=提示 $2=需避开的端口(空格分隔，可空) $3=strict(追加节点时：配置里已有的端口一律不能用)
 # 结果放在 ASKED_PORT
 ask_port() {
-    local prompt="$1" avoid=" ${2:-} " strict="${3:-}" p
+    local prompt="$1" avoid=" ${2:-} " strict="${3:-}" p ans hint
+    nat_load
+    if nat_on; then
+        hint=$(rand_free_port "${2:-}" "$strict" || true)
+        info "NAT 模式：回车自动使用商家映射端口${hint:+ $hint}（映射端口: $NAT_PORTS${NAT_SSH_PORT:+，SSH: $NAT_SSH_PORT}）"
+        [ -n "$hint" ] && prompt="${prompt/回车随机 20000-65000/回车使用映射端口 $hint}"
+    fi
     while true; do
         read -r -p "$prompt" p || { err "没有读到输入，已取消"; return 1; }
         p=$(printf '%s' "$p" | tr -d '[:space:]')
         if [ -z "$p" ]; then
-            p=$(rand_free_port "${2:-}" "$strict") || { err "没找到空闲端口，请手动输入"; continue; }
-            info "随机端口: $p"
+            if ! p=$(rand_free_port "${2:-}" "$strict"); then
+                if nat_on; then
+                    err "映射端口已经用完（$NAT_PORTS）。请手动输入，或在 sb「NAT 映射端口」里补充商家给的新端口"
+                else
+                    err "没找到空闲端口，请手动输入"
+                fi
+                continue
+            fi
+            info "自动选择端口: $p"
         fi
         if ! valid_port "$p"; then err "端口无效: $p（需为 1-65535 的数字）"; continue; fi
         p=$((10#$p))
+        if nat_on; then
+            if [ "$p" = "${NAT_SSH_PORT:-}" ]; then err "端口 $p 是 SSH 用的映射端口，不能用"; continue; fi
+            if ! in_words "$p" "$NAT_PORTS"; then
+                warn "端口 $p 不在商家映射端口($NAT_PORTS)里，外网很可能连不上"
+                read -r -p "仍然使用 $p ?(y/N): " ans || ans=""
+                [[ "$ans" =~ ^[Yy]$ ]] || continue
+            fi
+        fi
         if [[ "$avoid" == *" $p "* ]]; then err "端口 $p 已被本机其他节点使用，请换一个"; continue; fi
-        if landing_port "$p"; then err "端口 $p 已被本机的落地机节点($LANDING_CONFIG)使用，请换一个"; continue; fi
+        # NAT 模式下映射端口少：落地机只用了这个端口的 UDP(HY2/TUIC) 时，线路机节点(TCP)可以共用端口号
+        if landing_port "$p" && ! { nat_on && ! cfg_port_nets "$LANDING_CONFIG" x | grep -q "^$p tcp "; }; then
+            err "端口 $p 已被本机的落地机节点($LANDING_CONFIG)使用，请换一个"; continue
+        fi
         if [ -n "$strict" ]; then
             if own_port "$p"; then err "端口 $p 已被本机线路机的其他节点使用，请换一个"; continue; fi
             if port_in_use "$p"; then err "端口 $p 已被本机其他程序占用，请换一个"; continue; fi
@@ -2767,6 +3412,494 @@ rename_node() {
     show_link
 }
 
+# ===== NAT 模式（LXC/NAT 小鸡：商家只映射少数几个端口，入口IP ≠ 出口IP）=====
+# 落地机和线路机共用 /etc/sb-nat.conf：
+#   NAT_MODE=1/0  NAT_PORTS=商家映射端口  NAT_UDP_PORTS=其中也映射了 UDP 的端口  NAT_SSH_PORT=SSH 用的映射端口  ENTRY_IP=入口IP
+NAT_CONF="/etc/sb-nat.conf"
+NAT_MODE=0; NAT_PORTS=""; NAT_UDP_PORTS=""; NAT_SSH_PORT=""; ENTRY_IP=""
+NAT_USED=" "
+declare -A NAT_LABEL=()
+
+nat_load() {
+    NAT_MODE=0; NAT_PORTS=""; NAT_UDP_PORTS=""; NAT_SSH_PORT=""; ENTRY_IP=""
+    if [ -f "$NAT_CONF" ]; then
+        # shellcheck disable=SC1090
+        . "$NAT_CONF" 2>/dev/null || true
+    fi
+    return 0
+}
+
+nat_save() {
+    {
+        printf '# sb NAT 模式设置（落地机/线路机共用；sb 菜单「NAT 映射端口」「入口/出口 IP」里修改）\n'
+        printf 'NAT_MODE=%q\n' "$NAT_MODE"
+        printf 'NAT_PORTS=%q\n' "$NAT_PORTS"
+        printf 'NAT_UDP_PORTS=%q\n' "$NAT_UDP_PORTS"
+        printf 'NAT_SSH_PORT=%q\n' "$NAT_SSH_PORT"
+        printf 'ENTRY_IP=%q\n' "$ENTRY_IP"
+    } > "$NAT_CONF"
+    chmod 600 "$NAT_CONF" 2>/dev/null || true
+}
+
+nat_on() { [ "${NAT_MODE:-0}" = "1" ] && [ -n "${NAT_PORTS:-}" ]; }
+in_words() { [[ " $2 " == *" $1 "* ]]; }
+
+# 解析端口列表：逗号/空格分隔，支持范围 a-b（最多 256 个端口）；结果放 NAT_PARSED（升序去重）
+nat_parse_list() {
+    local item lo hi p out=""
+    for item in $(printf '%s' "$1" | tr ',，;' '   '); do
+        if [[ "$item" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            lo=$((10#${BASH_REMATCH[1]})); hi=$((10#${BASH_REMATCH[2]}))
+        elif [[ "$item" =~ ^[0-9]+$ ]]; then
+            lo=$((10#$item)); hi=$lo
+        else
+            return 1
+        fi
+        [ "$lo" -ge 1 ] && [ "$hi" -le 65535 ] && [ "$lo" -le "$hi" ] || return 1
+        [ $((hi - lo)) -le 256 ] || return 1
+        for ((p = lo; p <= hi; p++)); do out="$out $p"; done
+    done
+    NAT_PARSED=$(printf '%s\n' $out | sort -n -u | tr '\n' ' ' | sed 's/ *$//')
+    [ -n "$NAT_PARSED" ] && [ "$(printf '%s\n' $NAT_PARSED | wc -l)" -le 256 ]
+}
+
+# 某配置里各入站占用的 端口 网络 名称（SS=TCP+UDP，HY2/TUIC=UDP，其余=TCP）
+cfg_port_nets() {
+    [ -f "$1" ] && command -v jq >/dev/null 2>&1 || return 0
+    jq -r --arg who "$2" '(.inbounds // [])[] | select(.listen_port != null) | .listen_port as $p | (.tag // .type) as $t
+        | (if .type == "shadowsocks" then ["tcp","udp"] elif (.type == "hysteria2" or .type == "tuic") then ["udp"] else ["tcp"] end)[]
+        | "\($p) \(.) \($who):\($t)"' "$1" 2>/dev/null || true
+}
+
+# 收集已占用的 端口/网络：$@ = 配置文件（落地机/线路机）
+nat_collect_used() {
+    local f p n l who
+    NAT_USED=" "
+    NAT_LABEL=()
+    for f in "$@"; do
+        [ -f "$f" ] || continue
+        if [ "$f" = "$LANDING_CONFIG" ]; then who="落地机"; else who="线路机"; fi
+        while read -r p n l; do
+            [ -n "$p" ] || continue
+            NAT_USED="$NAT_USED$p/$n "
+            if [ "$n" = "udp" ] && [[ "${NAT_LABEL[$p]:-}" == *"$l(TCP)" ]]; then
+                NAT_LABEL[$p]="${NAT_LABEL[$p]%(TCP)}(TCP+UDP)"
+            else
+                NAT_LABEL[$p]="${NAT_LABEL[$p]:+${NAT_LABEL[$p]}, }$l($(printf '%s' "$n" | tr 'a-z' 'A-Z'))"
+            fi
+        done < <(cfg_port_nets "$f" "$who")
+    done
+}
+nat_mark() { NAT_USED="$NAT_USED$1/$2 "; }
+nat_used() { [[ "$NAT_USED" == *" $1/$2 "* ]]; }
+
+# 从映射端口里挑一个：$1 = tcp(VLESS/AnyTLS) | udp(HY2/TUIC，只用映射了 UDP 的端口) | ss(TCP+UDP)
+# 优先完全空闲的端口；TCP 协议优先不占用映射了 UDP 的端口（留给 HY2/TUIC）；不用 SSH 端口
+nat_pick() {
+    local need="$1" p score best="" bs=99
+    for p in $NAT_PORTS; do
+        [ "$p" = "${NAT_SSH_PORT:-}" ] && continue
+        score=0
+        case "$need" in
+            tcp)
+                nat_used "$p" tcp && continue
+                nat_used "$p" udp && score=$((score + 2))
+                in_words "$p" "$NAT_UDP_PORTS" && score=$((score + 1))
+                ;;
+            udp)
+                in_words "$p" "$NAT_UDP_PORTS" || continue
+                nat_used "$p" udp && continue
+                nat_used "$p" tcp && score=$((score + 2))
+                ;;
+            ss)
+                nat_used "$p" tcp && continue
+                nat_used "$p" udp && continue
+                in_words "$p" "$NAT_UDP_PORTS" && score=$((score + 1))
+                ;;
+        esac
+        if [ "$score" -lt "$bs" ]; then bs=$score; best=$p; fi
+    done
+    [ -n "$best" ] || return 1
+    printf '%s' "$best"
+}
+
+# 打印 映射端口 → 用途 表
+nat_table() {
+    local p maps use free=""
+    echo "   映射端口   商家映射      用途"
+    for p in $NAT_PORTS; do
+        maps="TCP"; in_words "$p" "$NAT_UDP_PORTS" && maps="TCP+UDP"
+        if [ "$p" = "${NAT_SSH_PORT:-}" ]; then
+            use="SSH(不能用)"
+        else
+            use="${NAT_LABEL[$p]:-}"
+            [ -z "$use" ] && { use="空闲"; free="$free $p"; }
+        fi
+        printf '   %-10s %-12s %s\n' "$p" "$maps" "$use"
+    done
+    echo "   剩余空闲映射端口:${free:- 无}"
+}
+
+# 本机 sshd 端口（检测不到为 22）
+detect_sshd_port() {
+    local p=""
+    p=$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}' || true)
+    [ -n "$p" ] || p=$(grep -Ei '^[[:space:]]*Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2; exit}' || true)
+    printf '%s' "${p:-22}"
+}
+
+# 交互输入 映射端口列表 / SSH 端口 / UDP 端口；$1=tcponly 时 UDP 回车默认沿用（线路机节点只用 TCP）
+# 环境变量: SINGBOX_NAT_PORTS SINGBOX_NAT_SSH_PORT SINGBOX_NAT_UDP(all|none|端口列表)
+nat_ask_ports() {
+    local in def sshd udp_in
+    echo ""
+    info "=== NAT 模式：填写商家映射给你的端口 ==="
+    echo "   NAT 小鸡只有商家映射的几个端口能从外网连进来（例如 56566,56567,56568 或 56566-56570）。"
+    echo "   脚本只会使用这些端口，自动给每个协议分配，不会碰 SSH 端口。"
+    def="${NAT_PORTS:-}"
+    in="${SINGBOX_NAT_PORTS:-}"
+    while true; do
+        if [ -z "$in" ]; then
+            read -r -p "商家映射端口列表${def:+(回车沿用 $def)}: " in || { err "没有读到输入，退出"; exit 1; }
+            in="${in:-$def}"
+        fi
+        if [ -n "$in" ] && nat_parse_list "$in"; then break; fi
+        err "端口列表格式不对: '${in}'（例: 56566,56567,56568 或 56566-56570，最多 256 个）"
+        in=""
+    done
+    NAT_PORTS="$NAT_PARSED"
+    sshd=$(detect_sshd_port)
+    def="${NAT_SSH_PORT:-}"
+    in_words "$def" "$NAT_PORTS" || def=""
+    if [ -z "$def" ] && in_words "$sshd" "$NAT_PORTS"; then def="$sshd"; fi
+    in="${SINGBOX_NAT_SSH_PORT-__ask__}"
+    while true; do
+        if [ "$in" = "__ask__" ]; then
+            echo "   本机 sshd 监听端口: $sshd。如果列表里有一个端口是商家给 SSH 用的(映射到本机 $sshd)，请填它；没有就输入 0。"
+            read -r -p "列表中的 SSH 端口${def:+(回车默认 $def)}: " in || { err "没有读到输入，退出"; exit 1; }
+            in="${in:-${def:-0}}"
+        fi
+        in=$(printf '%s' "$in" | tr -d '[:space:]')
+        if [ -z "$in" ] || [ "$in" = "0" ]; then NAT_SSH_PORT=""; break; fi
+        if in_words "$in" "$NAT_PORTS"; then NAT_SSH_PORT="$in"; break; fi
+        err "SSH 端口 $in 不在映射端口列表里"
+        in="__ask__"
+    done
+    def="${NAT_UDP_PORTS:-}"
+    udp_in="${SINGBOX_NAT_UDP:-}"
+    while true; do
+        if [ -z "$udp_in" ]; then
+            echo "   哪些端口商家也映射了 UDP？HY2/TUIC 只会放在映射了 UDP 的端口上（不确定就问商家，或填 none）。"
+            if [ -n "$def" ]; then
+                read -r -p "UDP 端口: all=全部 / none=没有 / 端口列表 (回车沿用 $def): " udp_in || { err "没有读到输入，退出"; exit 1; }
+                udp_in="${udp_in:-$def}"
+            else
+                read -r -p "UDP 端口: all=全部 / none=没有 / 端口列表 (回车默认 all): " udp_in || { err "没有读到输入，退出"; exit 1; }
+                udp_in="${udp_in:-all}"
+            fi
+        fi
+        case "$udp_in" in
+            all|ALL|All) NAT_UDP_PORTS="$NAT_PORTS"; break ;;
+            none|NONE|None|0) NAT_UDP_PORTS=""; break ;;
+        esac
+        if nat_parse_list "$udp_in"; then
+            local p ok=1 out=""
+            for p in $NAT_PARSED; do
+                if in_words "$p" "$NAT_PORTS"; then out="$out $p"; else err "UDP 端口 $p 不在映射端口列表里"; ok=0; fi
+            done
+            if [ "$ok" = 1 ]; then NAT_UDP_PORTS="${out# }"; break; fi
+        else
+            err "格式不对: '$udp_in'"
+        fi
+        udp_in=""
+    done
+    # SSH 端口不算可用的 UDP 端口
+    if [ -n "$NAT_SSH_PORT" ]; then
+        NAT_UDP_PORTS=$(printf '%s\n' $NAT_UDP_PORTS | grep -vx "$NAT_SSH_PORT" | tr '\n' ' ' | sed 's/ *$//' || true)
+    fi
+    info "映射端口: $NAT_PORTS | SSH: ${NAT_SSH_PORT:-无} | 映射了 UDP: ${NAT_UDP_PORTS:-无}"
+}
+
+# 是否像 NAT/容器（用于建议开启 NAT 模式）
+local_ip4() {
+    command -v ip >/dev/null 2>&1 || return 0
+    ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true
+}
+is_private4() {
+    local a b
+    [[ "$1" =~ ^([0-9]+)\.([0-9]+)\.[0-9]+\.[0-9]+$ ]] || return 1
+    a=${BASH_REMATCH[1]}; b=${BASH_REMATCH[2]}
+    [ "$a" -eq 10 ] || { [ "$a" -eq 172 ] && [ "$b" -ge 16 ] && [ "$b" -le 31 ]; } \
+        || { [ "$a" -eq 192 ] && [ "$b" -eq 168 ]; } || { [ "$a" -eq 100 ] && [ "$b" -ge 64 ] && [ "$b" -le 127 ]; }
+}
+in_container() {
+    [ -f /proc/user_beancounters ] || grep -qa 'container=' /proc/1/environ 2>/dev/null \
+        || grep -qE '/lxc/|lxc\.payload|docker' /proc/1/cgroup 2>/dev/null || [ -f /.dockerenv ] \
+        || { command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt -c -q 2>/dev/null; }
+}
+looks_nat() { in_container || is_private4 "$(local_ip4)"; }
+
+# 线路机全新安装时：本机像 NAT/容器且还没设置过时，询问是否开启 NAT 模式（SINGBOX_NAT_MODE=1/0 可跳过询问）
+nat_offer() {
+    nat_load
+    local ans="${SINGBOX_NAT_MODE:-}"
+    if [ -z "$ans" ]; then
+        [ -f "$NAT_CONF" ] && return 0
+        looks_nat || return 0
+        echo ""
+        warn "检测到本机是容器或在 NAT 后面（网卡是内网 IP）。"
+        echo "   如果商家只给了几个映射端口（LXC/NAT 小鸡），建议开启 NAT 模式：只用映射端口、自动分配，并单独记录入口IP。"
+        echo "   Oracle/AWS 这类所有端口都通的云服务器(1:1 NAT)选 n。"
+        read -r -p "是否开启 NAT 模式?(Y/n): " ans || ans=n
+        case "$ans" in [Nn]*) ans=0 ;; *) ans=1 ;; esac
+    fi
+    if [ "$ans" = "1" ]; then
+        NAT_MODE=1
+        nat_ask_ports
+    else
+        NAT_MODE=0
+    fi
+    nat_save
+}
+
+# ===== 入口IP（客户端连接用）与 出口IP（本机访问外网显示的 IP）=====
+valid_host() {
+    local h="$1" o
+    [ -n "$h" ] || return 1
+    if [[ "$h" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+        for o in "${BASH_REMATCH[@]:1}"; do [ "$((10#$o))" -le 255 ] || return 1; done
+        return 0
+    fi
+    [[ "$h" =~ ^[0-9A-Fa-f:.]+$ ]] && [[ "$h" == *:*:* ]] && return 0
+    [[ "$h" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]] && [[ "$h" =~ [A-Za-z] ]]
+}
+strip_host() { local h; h=$(printf '%s' "$1" | tr -d '[:space:]'); h="${h#[}"; printf '%s' "${h%]}"; }
+
+# 检测出口 IP 和运营商：EXIT_IP / EXIT_ORG / EXIT_WARP
+detect_exit_ip() {
+    local u trace
+    EXIT_IP=""; EXIT_ORG=""; EXIT_WARP=""
+    for u in https://api.ipify.org https://ipv4.icanhazip.com https://api64.ipify.org; do
+        EXIT_IP=$(curl -s --max-time 5 "$u" 2>/dev/null | tr -d '[:space:]' || true)
+        if valid_host "$EXIT_IP" && [[ "$EXIT_IP" =~ ^[0-9A-Fa-f:.]+$ ]]; then break; fi
+        EXIT_IP=""
+    done
+    [ -n "$EXIT_IP" ] || return 1
+    EXIT_ORG=$(curl -s --max-time 5 "https://ipinfo.io/${EXIT_IP}/org" 2>/dev/null | head -n1 | tr -d '\r' || true)
+    case "$EXIT_ORG" in *"{"*|*"<"*) EXIT_ORG="" ;; esac
+    trace=$(curl -s --max-time 5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
+    printf '%s\n' "$trace" | grep -qE '^warp=(on|plus)$' && EXIT_WARP=1
+    return 0
+}
+
+show_exit_ip() {
+    if detect_exit_ip; then
+        echo "   出口IP(本机访问外网时显示): ${EXIT_IP}${EXIT_ORG:+  ($EXIT_ORG)}${EXIT_WARP:+  [Cloudflare WARP]}"
+        if [ -n "$1" ] && [ "$(strip_host "$1")" != "$EXIT_IP" ]; then
+            echo "   入口IP 和出口IP 不一样：NAT 小鸡上这是正常的（出口可能是商家的解锁出口/家宽，或 WARP）。"
+            echo "   客户端/线路机一律连【入口IP】，看网站、解锁时显示的是【出口IP】。"
+        fi
+    else
+        echo "   出口IP: 检测失败（网络不通或检测接口被墙，不影响使用）"
+    fi
+}
+
+# 本机已保存的入口IP：/etc/sb-nat.conf 的 ENTRY_IP > 落地机 CUSTOM_IP > 线路机 relay.env 的 PUB_IP
+saved_entry_ip() {
+    local e=""
+    nat_load
+    e="$ENTRY_IP"
+    [ -n "$e" ] || e=$( (. "$LANDING_DIR/.config_cache" >/dev/null 2>&1; printf '%s' "${CUSTOM_IP:-}") 2>/dev/null || true)
+    # shellcheck disable=SC1090
+    [ -n "$e" ] || e=$( (. "$RELAY_ENV" >/dev/null 2>&1; printf '%s' "${PUB_IP:-}") 2>/dev/null || true)
+    strip_host "$e"
+}
+
+# 写入 KEY=VALUE（替换已有的 KEY）
+kv_put() {
+    local file="$1" key="$2" val="$3" tmp
+    [ -f "$file" ] || return 0
+    tmp=$(mktemp)
+    grep -v "^${key}=" "$file" > "$tmp" || true
+    printf '%s=%q\n' "$key" "$val" >> "$tmp"
+    cat "$tmp" > "$file"
+    rm -f "$tmp"
+}
+
+# 查看/修改入口IP：只重新生成链接（落地机 CUSTOM_IP、线路机 PUB_IP），不改节点、不重启
+# $1 = 新入口IP（可空，空则交互）
+entry_ip_menu() {
+    local cur new ans lc_host
+    cur=$(saved_entry_ip)
+    echo ""
+    info "=== 入口IP / 出口IP ==="
+    echo "   入口IP(节点链接里用的地址): ${cur:-未设置}"
+    show_exit_ip "$cur"
+    new=$(strip_host "${1:-}")
+    if [ -z "$new" ]; then
+        read -r -p "输入新的入口IP/域名(商家面板里的公网IP，回车不修改): " new || new=""
+        new=$(strip_host "$new")
+    fi
+    [ -n "$new" ] || { info "未修改"; return 0; }
+    if ! valid_host "$new"; then err "地址无效: '$new'（需为 IPv4、IPv6 或域名）"; return 1; fi
+    nat_load
+    ENTRY_IP="$new"
+    nat_save
+    lc_host="$new"; [[ "$lc_host" == *:* ]] && lc_host="[$lc_host]"
+    if [ -f "$LANDING_DIR/.config_cache" ]; then
+        kv_put "$LANDING_DIR/.config_cache" CUSTOM_IP "$lc_host"
+        info "落地机节点的入口地址已改为 $lc_host（输入 sb → 1 查看新链接）"
+    fi
+    if [ -f "$RELAY_ENV" ]; then
+        ans=y
+        if [ -f "$LANDING_DIR/.config_cache" ] && [ -z "${1:-}" ]; then
+            read -r -p "同时更新本机线路机/直连节点链接里的地址?(Y/n): " ans || ans=y
+        fi
+        if [[ ! "$ans" =~ ^[Nn]$ ]]; then
+            load_env || return 1
+            PUB_IP="$new"
+            save_env
+            build_links
+            info "线路机/直连节点链接已改用入口地址 $new（节点、端口、密钥都没变，服务未重启）："
+            show_link
+        fi
+    fi
+    return 0
+}
+
+# 查看/修改 NAT 映射端口（不改动已有节点）
+nat_menu() {
+    local c
+    nat_load
+    nat_collect_used "$LANDING_CONFIG" "$CONFIG"
+    echo ""
+    info "=== NAT 模式 / 映射端口 ==="
+    if nat_on; then
+        echo "   NAT 模式: 已开启（新协议/新节点只从下面的映射端口里自动选）"
+        nat_table
+    else
+        echo "   NAT 模式: 未开启${NAT_PORTS:+（已保存的映射端口: $NAT_PORTS）}"
+    fi
+    echo "1) 设置/修改映射端口列表（含 SSH 端口、哪些端口映射了 UDP），并开启 NAT 模式"
+    nat_on && echo "2) 关闭 NAT 模式（以后新节点随机端口，与普通 VPS 一样）"
+    echo "0) 返回"
+    read -r -p "请选择: " c || c=0
+    case "$c" in
+        1)
+            nat_ask_ports
+            NAT_MODE=1
+            nat_save
+            nat_collect_used "$LANDING_CONFIG" "$CONFIG"
+            nat_table
+            local p bad=""
+            for p in $(printf '%s\n' $NAT_USED | sed 's|/.*||' | sort -u); do
+                in_words "$p" "$NAT_PORTS" || bad="$bad $p"
+            done
+            [ -n "$bad" ] && warn "这些已有节点的端口不在映射列表里，外网可能连不上:${bad}（可在 sb 里「重置端口」改到映射端口）"
+            info "已保存到 $NAT_CONF（已有节点没有任何改动）"
+            ;;
+        2) if nat_on; then NAT_MODE=0; nat_save; info "已关闭 NAT 模式（端口列表保留在 $NAT_CONF）"; fi ;;
+        *) ;;
+    esac
+}
+
+# ===== 低内存：内存 ≤256MiB 时给 sing-box 设置 GOMEMLIMIT/GOGC =====
+mem_mib() {
+    local kb lim m=""
+    kb=$(awk '/^MemTotal:/{print $2; exit}' /proc/meminfo 2>/dev/null || true)
+    [ -n "$kb" ] && m=$((kb / 1024))
+    for lim in /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory/memory.limit_in_bytes; do
+        lim=$(cat "$lim" 2>/dev/null || true)
+        if [[ "$lim" =~ ^[0-9]+$ ]] && [ "$lim" -gt 0 ] && [ "$lim" -lt 1099511627776 ]; then
+            lim=$((lim / 1024 / 1024))
+            if [ -z "$m" ] || [ "$lim" -lt "$m" ]; then m="$lim"; fi
+        fi
+    done
+    printf '%s' "${m:-0}"
+}
+# 线路机服务的 GOMEMLIMIT（空 = 不限制）：本机也有落地机节点时两个 sing-box 各 45%，否则 75%
+relay_gomem() {
+    local m pct=75
+    m=$(mem_mib)
+    { [ -n "${SINGBOX_MEM_MIB:-}" ] && m="$SINGBOX_MEM_MIB"; } || true
+    [ "$m" -gt 0 ] && [ "$m" -le 256 ] || return 0
+    [ -f "$LANDING_CONFIG" ] && [ -f "$LANDING_DIR/.config_cache" ] && pct=45
+    printf '%sMiB' "$((m * pct / 100))"
+}
+
+# ===== 磁盘 / 安装缓存 =====
+check_disk() {
+    local avail
+    avail=$(df -Pk / 2>/dev/null | awk 'NR==2{print $4}' || true)
+    [[ "$avail" =~ ^[0-9]+$ ]] || return 0
+    avail=$((avail / 1024))
+    if [ "$avail" -lt 150 ]; then
+        warn "磁盘剩余空间只有约 ${avail} MB（低于 150MB）：安装 sing-box 需要约 50~80MB，空间不足可能失败。"
+        warn "   可先清理: rm -rf /var/cache/apk/* ; apt-get clean ; 删除不用的日志/文件"
+    else
+        info "磁盘剩余空间: 约 ${avail} MB"
+    fi
+}
+clean_pkg_cache() {
+    if command -v apk >/dev/null 2>&1; then
+        rm -rf /var/cache/apk/* 2>/dev/null || true
+    elif command -v apt-get >/dev/null 2>&1; then
+        apt-get clean >/dev/null 2>&1 || true
+    fi
+}
+
+# ===== 安装 sing-box：Alpine 优先官方仓库，版本太旧/没有时从 GitHub 下载官方二进制，再不行用 edge 仓库 =====
+SB_MIN_VER="1.11.0"   # hysteria2 ignore_client_bandwidth 需要 1.11；AnyTLS 需要 1.12（落地机安装时会提高要求）
+ver_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -t. -k1,1n -k2,2n -k3,3n | head -n1)" = "$2" ]; }
+sb_version() { sing-box version 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true; }
+sb_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64) echo amd64 ;; aarch64|arm64) echo arm64 ;; armv7*) echo armv7 ;; armv6*) echo armv6 ;;
+        i?86) echo 386 ;; s390x) echo s390x ;; riscv64) echo riscv64 ;; *) return 1 ;;
+    esac
+}
+install_singbox_github() {
+    local arch ver tmp dir v variants
+    arch=$(sb_arch) || { err "不支持的 CPU 架构: $(uname -m)"; return 1; }
+    ver=$(curl -fsSI --max-time 15 https://github.com/SagerNet/sing-box/releases/latest 2>/dev/null | tr -d '\r' \
+        | awk 'tolower($1)=="location:"{n=split($2,a,"/"); print a[n]}' | sed 's/^v//' || true)
+    [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { warn "获取 GitHub 上 sing-box 最新版本失败"; return 1; }
+    # Alpine(musl) 先用 -musl 版本；其他系统先用默认版本；下载后先运行一次确认能用，才替换现有程序
+    if ls /lib/ld-musl-* >/dev/null 2>&1; then variants="musl plain"; else variants="plain glibc"; fi
+    tmp=$(mktemp -d)
+    for v in $variants; do
+        if [ "$v" = "plain" ]; then v=""; else v="-$v"; fi
+        dir="sing-box-${ver}-linux-${arch}${v}"
+        info "从 GitHub 下载 sing-box ${ver}（官方程序 ${arch}${v}）..."
+        rm -rf "${tmp:?}"/*
+        if curl -fsSL --max-time 300 -o "$tmp/sb.tgz" "https://github.com/SagerNet/sing-box/releases/download/v${ver}/${dir}.tar.gz" \
+            && tar -xzf "$tmp/sb.tgz" -C "$tmp" && [ -f "$tmp/$dir/sing-box" ] && "$tmp/$dir/sing-box" version >/dev/null 2>&1; then
+            cp "$tmp/$dir/sing-box" /usr/bin/sing-box.new && chmod 755 /usr/bin/sing-box.new && mv -f /usr/bin/sing-box.new /usr/bin/sing-box
+            rm -rf "$tmp"
+            return 0
+        fi
+    done
+    rm -rf "$tmp" /usr/bin/sing-box.new
+    warn "从 GitHub 下载 sing-box 失败(或下载的程序在本机无法运行)"
+    return 1
+}
+# $1 = 最低版本
+install_singbox_alpine() {
+    local need="${1:-$SB_MIN_VER}" repo
+    repo=$(apk --no-cache search -x sing-box 2>/dev/null | sed -n 's/^sing-box-\([0-9][0-9.]*\)-r[0-9]*$/\1/p' | head -n1 || true)
+    if [ -n "$repo" ] && ver_ge "$repo" "$need"; then
+        info "使用 Alpine 官方仓库的 sing-box $repo"
+        apk add --no-cache sing-box && return 0
+    elif [ -n "$repo" ]; then
+        warn "Alpine 官方仓库的 sing-box 是 $repo，低于本脚本需要的 $need，改从 GitHub 下载"
+    else
+        info "当前 Alpine 版本的官方仓库没有 sing-box，改从 GitHub 下载"
+    fi
+    install_singbox_github && return 0
+    warn "改用 Alpine edge 仓库安装 sing-box"
+    apk add --no-cache --repository=http://dl-cdn.alpinelinux.org/alpine/edge/community sing-box
+}
+
 # ===== 服务管理：独立服务 sing-box-relay（systemd 或 OpenRC），与落地机的 sing-box 服务互不影响 =====
 svc_kind() {
     if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
@@ -2782,14 +3915,19 @@ svc_kind() {
 
 singbox_bin() { command -v sing-box 2>/dev/null || echo /usr/bin/sing-box; }
 
-# 写入服务文件并设置开机自启（不启动）
-install_service() {
-    local bin
+# 服务文件内容：$1 = openrc | systemd（内存 ≤256MiB 时加 GOMEMLIMIT/GOGC）
+service_text() {
+    local bin gm
     bin=$(singbox_bin)
-    case "$(svc_kind)" in
+    gm=$(relay_gomem)
+    case "$1" in
         openrc)
-            cat > "$OPENRC_INIT" <<SVC
-#!/sbin/openrc-run
+            echo "#!/sbin/openrc-run"
+            if [ -n "$gm" ]; then
+                echo "export GOMEMLIMIT=${gm}"
+                echo "export GOGC=70"
+            fi
+            cat <<SVC
 name="${SVC_NAME}"
 description="sing-box relay (线路机中转/直连节点)"
 command="${bin}"
@@ -2799,18 +3937,16 @@ pidfile="/run/${SVC_NAME}.pid"
 output_log="/var/log/${SVC_NAME}.log"
 error_log="/var/log/${SVC_NAME}.err"
 supervisor=supervise-daemon
-supervise_daemon_args="--respawn-max 0 --respawn-delay 5"
+supervise_daemon_args="--respawn-max 0 --respawn-delay 5${gm:+ --env GOMEMLIMIT=${gm} --env GOGC=70}"
 
 depend() {
     need net
     after firewall
 }
 SVC
-            chmod +x "$OPENRC_INIT"
-            rc-update add "$SVC_NAME" default >/dev/null 2>&1 || warn "添加开机自启失败: rc-update add $SVC_NAME default"
             ;;
         systemd)
-            cat > "$SYSTEMD_UNIT" <<SVC
+            cat <<SVC
 [Unit]
 Description=sing-box relay (线路机中转/直连节点)
 After=network.target nss-lookup.target
@@ -2824,10 +3960,29 @@ ExecStart=${bin} run -c ${CONFIG}
 Restart=on-failure
 RestartSec=10s
 LimitNOFILE=1048576
-
+${gm:+Environment=GOMEMLIMIT=${gm}
+Environment=GOGC=70
+}
 [Install]
 WantedBy=multi-user.target
 SVC
+            ;;
+    esac
+}
+
+# 写入服务文件并设置开机自启（不启动）
+install_service() {
+    local gm
+    gm=$(relay_gomem)
+    [ -n "$gm" ] && info "低内存模式: $SVC_NAME 服务设置 GOMEMLIMIT=${gm} GOGC=70"
+    case "$(svc_kind)" in
+        openrc)
+            service_text openrc > "$OPENRC_INIT"
+            chmod +x "$OPENRC_INIT"
+            rc-update add "$SVC_NAME" default >/dev/null 2>&1 || warn "添加开机自启失败: rc-update add $SVC_NAME default"
+            ;;
+        systemd)
+            service_text systemd > "$SYSTEMD_UNIT"
             systemctl daemon-reload || true
             systemctl enable "$SVC_NAME" >/dev/null 2>&1 || warn "设置开机自启失败: systemctl enable $SVC_NAME"
             ;;
@@ -2839,6 +3994,31 @@ SVC
 }
 
 service_installed() { [ -f "$SYSTEMD_UNIT" ] || [ -f "$OPENRC_INIT" ]; }
+
+# 升级时：服务文件和应有内容不同（例如内存 ≤256MiB 需要 GOMEMLIMIT）就更新；只在服务原本运行时重启
+refresh_service() {
+    local kind target tmp gm
+    kind=$(svc_kind)
+    case "$kind" in
+        openrc) target="$OPENRC_INIT" ;;
+        systemd) target="$SYSTEMD_UNIT" ;;
+        *) return 0 ;;
+    esac
+    [ -f "$target" ] || return 0
+    tmp=$(mktemp)
+    service_text "$kind" > "$tmp"
+    if cmp -s "$tmp" "$target"; then rm -f "$tmp"; return 0; fi
+    cat "$tmp" > "$target"
+    rm -f "$tmp"
+    [ "$kind" = "openrc" ] && chmod +x "$target"
+    [ "$kind" = "systemd" ] && { systemctl daemon-reload >/dev/null 2>&1 || true; }
+    gm=$(relay_gomem)
+    info "已更新 $SVC_NAME 服务文件${gm:+（内存 ≤256MiB：GOMEMLIMIT=${gm} GOGC=70）}"
+    if svc_active; then
+        svc_restart >/dev/null 2>&1 && info "已重启 $SVC_NAME 使设置生效（节点/端口/链接不变）" || warn "重启 $SVC_NAME 失败，请运行: bash $SELF_COPY status"
+    fi
+    return 0
+}
 
 svc_restart() {
     service_installed || install_service || return 1
@@ -3266,7 +4446,7 @@ MAIN_URL=https://raw.githubusercontent.com/demonmanch/singbox-deploy/main/instal
 if [ "$(id -u)" != "0" ]; then echo "请以 root 运行 sb"; exit 1; fi
 case "${1:-}" in
     relay) shift; exec bash "$RELAY" "$@" ;;
-    logclean|loglevel) exec bash "$RELAY" "$@" ;;
+    logclean|loglevel|entryip|natports) exec bash "$RELAY" "$@" ;;
 esac
 while true; do
     echo ""
@@ -3281,6 +4461,8 @@ while true; do
     echo "6) 安装落地机节点(运行落地机一键脚本，不影响线路机节点)"
     echo "7) 清理日志(立即清空 sing-box 日志)"
     echo "8) 日志级别(warn/info 切换)"
+    echo "9) 入口/出口 IP(修改入口IP 只重新生成链接)"
+    echo "10) NAT 映射端口(查看/修改)"
     echo "0) 退出"
     echo "=========================="
     read -r -p "请输入选项: " opt || exit 0
@@ -3308,6 +4490,8 @@ while true; do
             ;;
         7) bash "$RELAY" logclean || true ;;
         8) bash "$RELAY" loglevel || true ;;
+        9) bash "$RELAY" entryip || true ;;
+        10) bash "$RELAY" natports || true ;;
         0) exit 0 ;;
         *) echo "无效选项: $opt" ;;
     esac
@@ -3322,6 +4506,11 @@ SB_SHORTCUT
 firewall_reminder() {
     local p ans
     echo ""
+    nat_load
+    if nat_on; then
+        warn "NAT 模式：端口 $* 是商家映射端口；如果连不上，请到商家面板确认这些端口已映射到本机。"
+        return 0
+    fi
     warn "=================== ⚠️ 重要：放行端口 ==================="
     warn "请在云厂商安全组放行端口(TCP): $*  ，否则节点连不上！"
     echo "   Oracle 甲骨文云: 控制台 → 网络(Networking) → 虚拟云网络(Virtual Cloud Networks)"
@@ -3845,7 +5034,7 @@ do_upgrade() {
     load_env || return 1
     mkdir -p "$SB_DIR"
     save_self_copy
-    if ! service_installed; then install_service || true; fi
+    if ! service_installed; then install_service || true; else refresh_service; fi
     if ! svc_active; then svc_restart || warn "启动 $SVC_NAME 失败，请运行: bash $SELF_COPY status"; fi
     info "✅ 线路机脚本已更新到 $SELF_COPY（节点、端口、链接都没有改动）"
     echo "   以后管理: 输入 sb（或 bash $SELF_COPY）"
@@ -3874,6 +5063,7 @@ uninstall_relay() {
     info "✅ 线路机节点已卸载"
     log_remove
     if [ ! -f "$LANDING_CONFIG" ]; then
+        rm -f "$NAT_CONF"
         info "本机也没有落地机节点；sing-box 程序保留在 $(singbox_bin)，不需要可自行删除"
     fi
 }
@@ -3926,6 +5116,8 @@ relay_menu() {
     echo "9) ⚠️ 全部重新安装（删除所有线路机节点，旧链接全部失效）"
     echo "10) 清理日志(立即清空 sing-box 日志)"
     echo "11) 日志级别(warn/info 切换，排查问题时临时用 info)"
+    echo "12) 入口/出口 IP(查看；修改入口IP 只重新生成链接)"
+    echo "13) NAT 映射端口(查看/修改商家映射端口，新节点自动从中选)"
     echo "0) 退出"
     echo "===================================================="
     read -r -p "请选择(直接回车 = 1): " choice || choice=0
@@ -3940,6 +5132,8 @@ relay_menu() {
         8) uninstall_relay; return $? ;;
         10) log_clean_now; return 0 ;;
         11) log_level_menu; return $? ;;
+        12) entry_ip_menu; return $? ;;
+        13) nat_menu; return 0 ;;
         9)
             if ! landing_valid; then
                 err "本脚本里没有有效的落地机参数。请在落地机上运行 sb → 生成线路机脚本，再用新脚本重新安装。"
@@ -3967,6 +5161,8 @@ usage() {
     echo "  uninstall 卸载线路机节点(不影响落地机节点)"
     echo "  logclean  立即清空 sing-box 日志"
     echo "  loglevel [warn|info]  切换日志级别(落地机和线路机配置都会改)"
+    echo "  entryip [IP]  查看出口IP / 修改入口IP(只重新生成链接)"
+    echo "  natports  查看/修改 NAT 映射端口"
     echo "  install   全部重新安装(删除所有线路机节点)"
 }
 
@@ -4003,7 +5199,7 @@ fresh_install() {
     if ! command -v jq >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1 || ! command -v openssl >/dev/null 2>&1; then
         info "安装依赖..."
         case "$OS" in
-            alpine) apk update; apk add --no-cache curl jq bash openssl ca-certificates ;;
+            alpine) apk add --no-cache curl jq bash ca-certificates ;;
             debian) apt-get update -y; apt-get install -y curl jq bash openssl ca-certificates ;;
             redhat) yum install -y curl jq bash openssl ca-certificates ;;
         esac
@@ -4011,14 +5207,25 @@ fresh_install() {
 
     if command -v sing-box >/dev/null 2>&1; then
         info "本机已安装 sing-box: $(sing-box version 2>/dev/null | head -n1)（与落地机节点共用同一个程序）"
+        local have
+        have=$(sb_version)
+        if [ -n "$have" ] && ! ver_ge "$have" "$SB_MIN_VER"; then
+            warn "sing-box $have 低于建议版本 $SB_MIN_VER，可在 sb 里选「更新 sing-box」"
+        fi
     else
+        check_disk
         info "安装 sing-box..."
         case "$OS" in
-            alpine) apk add --repository=http://dl-cdn.alpinelinux.org/alpine/edge/community sing-box ;;
-            *) bash <(curl -fsSL https://sing-box.app/install.sh) ;;
+            alpine) install_singbox_alpine "$SB_MIN_VER" || true ;;
+            *) (cd "$(mktemp -d)" && bash <(curl -fsSL https://sing-box.app/install.sh)) || true ;;
         esac
+        clean_pkg_cache
+        command -v sing-box >/dev/null 2>&1 && info "sing-box 版本: $(sb_version)"
     fi
     command -v sing-box >/dev/null 2>&1 || { err "sing-box 安装失败"; return 1; }
+
+    # NAT/容器：询问是否开启 NAT 模式（只用商家映射端口）
+    nat_offer
 
     UUID=$(new_uuid)
 
@@ -4042,15 +5249,29 @@ fresh_install() {
         LISTEN_PORT="$ASKED_PORT"
     fi
 
-    PUB_IP=""
-    for ip_url in https://api.ipify.org https://api64.ipify.org https://icanhazip.com; do
-        PUB_IP=$(curl -s --max-time 5 "$ip_url" 2>/dev/null | tr -d '[:space:]' || true)
-        # 只接受像 IP 的结果（防止把错误页面写进链接）
-        if [[ "$PUB_IP" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || [[ "$PUB_IP" =~ ^[0-9A-Fa-f:]+$ && "$PUB_IP" == *:*:* ]]; then
-            break
+    # 入口IP：本机已保存的(NAT 入口IP / 落地机 CUSTOM_IP)优先；否则自动检测，NAT/容器/WARP 时请用户确认
+    PUB_IP=$(saved_entry_ip)
+    if [ -n "$PUB_IP" ]; then
+        info "使用本机已保存的入口IP: $PUB_IP（链接里用它；可在 sb「入口/出口 IP」修改）"
+    else
+        detect_exit_ip || true
+        PUB_IP="${EXIT_IP:-}"
+        nat_load
+        if nat_on || looks_nat || [ -n "${EXIT_WARP:-}" ] || [ -z "$PUB_IP" ]; then
+            echo ""
+            info "=== 本机入口IP（客户端连接用）==="
+            show_exit_ip ""
+            echo "   NAT 小鸡请填商家面板里的公网IP/域名（也就是 SSH 登录用的 IP），不要填出口IP。"
+            while true; do
+                read -r -p "请输入本机入口IP/域名${PUB_IP:+(回车使用 $PUB_IP)}: " ip_url || ip_url=""
+                ip_url=$(strip_host "${ip_url:-$PUB_IP}")
+                if valid_host "$ip_url"; then PUB_IP="$ip_url"; break; fi
+                err "地址无效: '${ip_url}'"
+            done
+            ENTRY_IP="$PUB_IP"
+            nat_save
         fi
-        PUB_IP=""
-    done
+    fi
     [ -z "$PUB_IP" ] && PUB_IP="YOUR_RELAY_IP"
     set_pub_ip_uri
 
@@ -4218,6 +5439,11 @@ case "$MODE" in
     logclean) log_clean_now; exit 0 ;;
     loglevel) log_level_menu "${2:-}"; exit $? ;;
     logremove) log_remove; exit 0 ;;
+    # NAT 模式 / 入口IP / 安装 sing-box（sb 面板也调用这些）
+    natpick) nat_load; nat_on || exit 2; nat_collect_used "$LANDING_CONFIG" "$CONFIG"; nat_pick "${2:-tcp}"; exit $? ;;
+    natports|nat) nat_menu; exit 0 ;;
+    entryip) entry_ip_menu "${2:-}"; exit $? ;;
+    sbinstall) check_disk; rc=0; install_singbox_alpine "${2:-$SB_MIN_VER}" || rc=$?; clean_pkg_cache; exit "$rc" ;;
 esac
 
 # 旧版线路机（节点在 /etc/sing-box）先迁移到独立目录/服务；迁移失败就停下，绝不另装一套
@@ -4296,14 +5522,23 @@ action_generate_relay() {
         if [[ "$deploy_ss" =~ ^[Yy]$ ]]; then
             info "开始部署 SS 协议..."
 
-            # 让用户选择端口（校验 1-65535）
+            # 让用户选择端口（校验 1-65535）；NAT 模式下默认从剩余映射端口里选
+            local nat_def=""
+            nat_def=$(nat_suggest_port ss || true)
             while true; do
-                read -r -p "请输入 SS 端口(NAT 机器请填商家映射的端口，留空则随机 10000-60000): " USER_SS_PORT
-                SS_PORT="${USER_SS_PORT:-$(rand_port)}"
+                if [ -n "$nat_def" ]; then
+                    read -r -p "请输入 SS 端口(NAT 模式，回车使用空闲映射端口 ${nat_def}): " USER_SS_PORT
+                    SS_PORT="${USER_SS_PORT:-$nat_def}"
+                else
+                    read -r -p "请输入 SS 端口(NAT 机器请填商家映射的端口，留空则随机 10000-60000): " USER_SS_PORT
+                    SS_PORT="${USER_SS_PORT:-$(rand_port)}"
+                fi
                 if ! validate_port "$SS_PORT"; then
                     err "端口无效: $SS_PORT (需为 1-65535 的数字)"
                 elif jq -e --argjson p "$SS_PORT" 'any((.inbounds // [])[]; .listen_port == $p)' "$CONFIG_PATH" >/dev/null 2>&1; then
                     err "端口 $SS_PORT 已被本机其他节点使用，请换一个"
+                elif ! check_new_port "$SS_PORT"; then
+                    :
                 else
                     break
                 fi
@@ -4398,6 +5633,9 @@ action_generate_relay() {
     # 落地机入口地址：NAT/转发机上自动检测到的通常是【出口IP】，客户端/线路机连不上，
     # 因此不再静默使用检测结果，必须由用户确认或输入商家提供的【入口IP/连接地址】
     local INBOUND_IP="" DETECTED_IP confirm input_ip SSH_PORT DETECTED_SSH_PORT input_ssh
+    sb_nat_load
+    # NAT 模式记录的入口IP 作为默认
+    [ -z "${CUSTOM_IP:-}" ] && [ -n "${ENTRY_IP:-}" ] && CUSTOM_IP="$ENTRY_IP"
     detect_public_ip || true
     DETECTED_IP="$(normalize_host "${DETECTED_IP:-YOUR_SERVER_IP}")"
     [ -n "${NAT_REASON:-}" ] && warn "$NAT_REASON"
@@ -4407,6 +5645,9 @@ action_generate_relay() {
     echo "   出口IP: 本机访问外网时显示的 IP。NAT/转发机上出口IP 与入口IP 往往不同，填出口IP 将无法连接！"
     echo "   参考 - 自动检测到的出口IP: ${DETECTED_IP} （NAT 机器上通常不可用）"
     echo "   注意 - NAT 机器上 SS 端口(${SS_PORT})必须是商家映射给你的端口之一，否则线路机无法连到落地机"
+    if sb_nat_on && ! sb_in_words "$SS_PORT" "$NAT_PORTS"; then
+        warn "NAT 模式：SS 端口 ${SS_PORT} 不在映射端口(${NAT_PORTS})里，线路机很可能连不上！可先在菜单里重置 SS 端口"
+    fi
     if [ -n "${CUSTOM_IP:-}" ]; then
         echo "   已保存的连接地址(CUSTOM_IP): ${CUSTOM_IP}"
     fi
@@ -4441,6 +5682,8 @@ action_generate_relay() {
     fi
     DETECTED_SSH_PORT="${DETECTED_SSH_PORT:-22}"
     SSH_PORT="${LANDING_SSH_PORT:-$DETECTED_SSH_PORT}"
+    # NAT 模式：默认用映射端口列表里标记的 SSH 端口
+    if sb_nat_on && [ -n "${NAT_SSH_PORT:-}" ]; then SSH_PORT="$NAT_SSH_PORT"; fi
     validate_port "$SSH_PORT" || SSH_PORT="$DETECTED_SSH_PORT"
     while true; do
         read -r -p "请输入落地机的 SSH 连接端口(就是你平时 SSH 登录本机用的端口，NAT 机器填商家映射的端口，回车默认 ${SSH_PORT}): " input_ssh
@@ -4659,6 +5902,23 @@ MENU
 
     MENU_MAP[$option]="log_level"
     echo "$((option))) 日志级别(当前 $(current_log_levels)，切换 warn/info)"
+    option=$((option + 1))
+
+    MENU_MAP[$option]="add_protocol"
+    echo "$((option))) 添加协议(给本机落地机加一个新协议，已有节点不变)"
+    option=$((option + 1))
+
+    MENU_MAP[$option]="entry_ip"
+    echo "$((option))) 入口/出口 IP(查看出口IP，修改链接用的入口IP)"
+    option=$((option + 1))
+
+    sb_nat_load
+    MENU_MAP[$option]="nat_ports"
+    if sb_nat_on; then
+        echo "$((option))) NAT 映射端口(已开启: ${NAT_PORTS})"
+    else
+        echo "$((option))) NAT 映射端口(LXC/NAT 小鸡用，当前未开启)"
+    fi
     
     cat <<MENU2
 0) 退出
@@ -4666,17 +5926,207 @@ MENU
 MENU2
 }
 
+# sing-box 版本 >= $1 (x.y.z) ?
+sb_ver_at_least() {
+    local v
+    v=$(sing-box version 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)
+    [ -n "$v" ] || return 1
+    [ "$(printf '%s\n%s\n' "$1" "$v" | sort -t. -k1,1n -k2,2n -k3,3n | head -n1)" = "$1" ]
+}
+
+# 添加协议：给已安装的落地机加一个还没启用的协议（不改动已有节点的端口/密码/链接）
+action_add_protocol() {
+    read_config || return 1
+    local keys=() names=() i c key mode nets port in ans nat_def inbound pk="" sid="" pub="" sni
+    [ "${ENABLE_SS:-false}" = "true" ]      || { keys+=(ss);      names+=("Shadowsocks (SS，TCP+UDP，可作为线路机的出口)"); }
+    [ "${ENABLE_HY2:-false}" = "true" ]     || { keys+=(hy2);     names+=("Hysteria2 (HY2，UDP)"); }
+    [ "${ENABLE_TUIC:-false}" = "true" ]    || { keys+=(tuic);    names+=("TUIC (UDP)"); }
+    [ "${ENABLE_REALITY:-false}" = "true" ] || { keys+=(reality); names+=("VLESS Reality (TCP)"); }
+    [ "${ENABLE_ANYTLS:-false}" = "true" ]  || { keys+=(anytls);  names+=("AnyTLS Reality (TCP)"); }
+    if [ "${#keys[@]}" -eq 0 ]; then
+        info "所有协议都已启用，没有可添加的协议"
+        return 0
+    fi
+    echo ""
+    echo "可添加的协议（已有节点不会改动）:"
+    for i in "${!keys[@]}"; do echo "$((i + 1))) ${names[$i]}"; done
+    echo "0) 返回"
+    read -r -p "请选择: " c || c=0
+    [[ "$c" =~ ^[0-9]+$ ]] && [ "$c" -ge 1 ] && [ "$c" -le "${#keys[@]}" ] || return 0
+    key="${keys[$((c - 1))]}"
+    case "$key" in
+        ss) mode=ss; nets="tcp udp" ;;
+        hy2|tuic) mode=udp; nets="udp" ;;
+        *) mode=tcp; nets="tcp" ;;
+    esac
+    if [ "$key" = "anytls" ] && ! sb_ver_at_least 1.12.0; then
+        err "AnyTLS 需要 sing-box 1.12 或更新版本，当前: $(sing-box version 2>/dev/null | head -n1)。请先在菜单里「更新 sing-box」"
+        return 1
+    fi
+
+    # 端口：NAT 模式从剩余映射端口里自动选（HY2/TUIC 只用映射了 UDP 的端口）
+    sb_nat_load
+    nat_def=""
+    if sb_nat_on; then
+        nat_def=$(nat_suggest_port "$mode" || true)
+        if [ -z "$nat_def" ]; then
+            if [ "$mode" = "udp" ]; then
+                warn "NAT 模式：没有空闲的映射了 UDP 的端口(UDP 端口: ${NAT_UDP_PORTS:-无})，$key 外网连不上。可在「NAT 映射端口」里补充"
+            else
+                warn "NAT 模式：映射端口($NAT_PORTS)已经用完"
+            fi
+        fi
+    fi
+    while true; do
+        if [ -n "$nat_def" ]; then
+            read -r -p "端口(回车使用空闲映射端口 ${nat_def}): " in || in=""
+        else
+            read -r -p "端口(回车随机 10000-60000): " in || in=""
+        fi
+        in=$(printf '%s' "$in" | tr -d '[:space:]')
+        port="${in:-${nat_def:-$(rand_port)}}"
+        validate_port "$port" || { err "端口无效: $port"; continue; }
+        port=$((10#$port))
+        if port_nets_overlap "$CONFIG_PATH" "$port" "$nets"; then
+            err "端口 $port 已被本机落地机的其他协议使用，请换一个"; continue
+        fi
+        check_new_port "$port" "$nets" || continue
+        if sb_nat_on && [ "$mode" = "udp" ] && sb_in_words "$port" "$NAT_PORTS" && ! sb_in_words "$port" "$NAT_UDP_PORTS"; then
+            warn "端口 $port 没有映射 UDP，$key 外网连不上"
+            read -r -p "仍然使用 $port ?(y/N): " ans || ans=""
+            [[ "$ans" =~ ^[Yy]$ ]] || continue
+        fi
+        break
+    done
+
+    # 证书 / Reality 密钥（Reality 与 AnyTLS 共用一套）
+    sni="${REALITY_SNI:-addons.mozilla.org}"
+    if [ "$key" = "hy2" ] || [ "$key" = "tuic" ]; then
+        if [ ! -f /etc/sing-box/certs/fullchain.pem ] || [ ! -f /etc/sing-box/certs/privkey.pem ]; then
+            ensure_openssl || { err "需要 openssl 生成自签证书"; return 1; }
+            mkdir -p /etc/sing-box/certs
+            openssl req -x509 -newkey rsa:2048 -nodes -keyout /etc/sing-box/certs/privkey.pem \
+                -out /etc/sing-box/certs/fullchain.pem -days 3650 -subj "/CN=www.bing.com" >/dev/null 2>&1 \
+                || { err "证书生成失败"; return 1; }
+        fi
+    fi
+    if [ "$key" = "reality" ] || [ "$key" = "anytls" ]; then
+        pk=$(jq -r 'first((.inbounds // [])[] | select(.tls.reality.enabled == true) | .tls.reality.private_key) // empty' "$CONFIG_PATH" 2>/dev/null || true)
+        sid=$(jq -r 'first((.inbounds // [])[] | select(.tls.reality.enabled == true) | .tls.reality.short_id[0]) // empty' "$CONFIG_PATH" 2>/dev/null || true)
+        local esni
+        esni=$(jq -r 'first((.inbounds // [])[] | select(.tls.reality.enabled == true) | .tls.server_name) // empty' "$CONFIG_PATH" 2>/dev/null || true)
+        [ -n "$esni" ] && sni="$esni"
+        pub=$(cat /etc/sing-box/.reality_pub 2>/dev/null || true)
+        if [ -z "$pk" ] || [ -z "$pub" ] || [ -z "$sid" ]; then
+            local kp
+            kp=$(sing-box generate reality-keypair 2>/dev/null || true)
+            pk=$(printf '%s\n' "$kp" | awk '/PrivateKey/{print $NF}' | tr -d '\r')
+            pub=$(printf '%s\n' "$kp" | awk '/PublicKey/{print $NF}' | tr -d '\r')
+            sid=$(sing-box generate rand 8 --hex 2>/dev/null || true)
+            [ -n "$pk" ] && [ -n "$pub" ] && [ -n "$sid" ] || { err "生成 Reality 密钥失败"; return 1; }
+        fi
+    fi
+
+    local p1="" p2="" bw=false
+    case "$key" in
+        ss)
+            p1=$(rand_pass)
+            inbound=$(jq -n --argjson port "$port" --arg psk "$p1" '{type:"shadowsocks",listen:"::",listen_port:$port,method:"aes-128-gcm",password:$psk,tag:"ss-in"}')
+            ;;
+        hy2)
+            p1=$(rand_pass)
+            sb_ver_at_least 1.11.0 && bw=true
+            inbound=$(jq -n --argjson port "$port" --arg psk "$p1" --argjson bw "$bw" '{type:"hysteria2",tag:"hy2-in",listen:"::",listen_port:$port,users:[{password:$psk}]}
+                + (if $bw then {ignore_client_bandwidth:true} else {} end)
+                + {tls:{enabled:true,alpn:["h3"],certificate_path:"/etc/sing-box/certs/fullchain.pem",key_path:"/etc/sing-box/certs/privkey.pem"}}')
+            ;;
+        tuic)
+            p1=$(rand_uuid); p2=$(rand_pass)
+            inbound=$(jq -n --argjson port "$port" --arg u "$p1" --arg psk "$p2" '{type:"tuic",tag:"tuic-in",listen:"::",listen_port:$port,users:[{uuid:$u,password:$psk}],congestion_control:"bbr",
+                tls:{enabled:true,alpn:["h3"],certificate_path:"/etc/sing-box/certs/fullchain.pem",key_path:"/etc/sing-box/certs/privkey.pem"}}')
+            ;;
+        reality)
+            p1=$(rand_uuid)
+            inbound=$(jq -n --argjson port "$port" --arg u "$p1" --arg sni "$sni" --arg pk "$pk" --arg sid "$sid" '{type:"vless",tag:"vless-in",listen:"::",listen_port:$port,users:[{uuid:$u,flow:"xtls-rprx-vision"}],
+                tls:{enabled:true,server_name:$sni,reality:{enabled:true,handshake:{server:$sni,server_port:443},private_key:$pk,short_id:[$sid]}}}')
+            ;;
+        anytls)
+            p1=$(head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n'); p2=$(rand_pass)
+            inbound=$(jq -n --argjson port "$port" --arg u "$p1" --arg psk "$p2" --arg sni "$sni" --arg pk "$pk" --arg sid "$sid" '{type:"anytls",tag:"anytls-in",listen:"::",listen_port:$port,users:[{name:$u,password:$psk}],padding_scheme:[],
+                tls:{enabled:true,server_name:$sni,reality:{enabled:true,handshake:{server:$sni,server_port:443},private_key:$pk,short_id:[$sid]}}}')
+            ;;
+    esac
+
+    local bak="${CONFIG_PATH}.bak.addproto" out
+    cp "$CONFIG_PATH" "$bak"
+    if ! jq --argjson ib "$inbound" '.inbounds = ((.inbounds // []) + [$ib])' "$bak" > "${CONFIG_PATH}.tmp"; then
+        rm -f "${CONFIG_PATH}.tmp"; err "写入配置失败，未改动"; return 1
+    fi
+    mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+    if ! out=$(sing-box check -c "$CONFIG_PATH" 2>&1); then
+        cp "$bak" "$CONFIG_PATH"
+        err "配置校验失败，已还原，节点未改动:"
+        printf '%s\n' "$out" | tail -n 10 >&2
+        return 1
+    fi
+    if ! service_restart; then
+        cp "$bak" "$CONFIG_PATH"
+        service_restart || true
+        err "重启失败，已还原配置"
+        return 1
+    fi
+
+    local K
+    K=$(printf '%s' "$key" | tr 'a-z' 'A-Z')
+    kv_set /etc/sing-box/.protocols "ENABLE_$K" true
+    cache_set "ENABLE_$K" true
+    case "$key" in
+        ss) cache_set SS_PORT "$port"; cache_set SS_PSK "$p1"; cache_set SS_METHOD aes-128-gcm ;;
+        hy2) cache_set HY2_PORT "$port"; cache_set HY2_PSK "$p1" ;;
+        tuic) cache_set TUIC_PORT "$port"; cache_set TUIC_UUID "$p1"; cache_set TUIC_PSK "$p2" ;;
+        reality) cache_set REALITY_PORT "$port"; cache_set REALITY_UUID "$p1" ;;
+        anytls) cache_set ANYTLS_PORT "$port"; cache_set ANYTLS_USER "$p1"; cache_set ANYTLS_PSK "$p2" ;;
+    esac
+    if [ "$key" = "reality" ] || [ "$key" = "anytls" ]; then
+        cache_set REALITY_PK "$pk"; cache_set REALITY_SID "$sid"; cache_set REALITY_PUB "$pub"; cache_set REALITY_SNI "$sni"
+        printf '%s' "$pub" > /etc/sing-box/.reality_pub
+    fi
+    rm -f "$bak"
+    info "已添加 $key，端口 $port（其他节点未改动）"
+    if [ "$mode" != "tcp" ] && ! sb_nat_on; then
+        warn "$key 使用 UDP 端口 $port：如果有云防火墙/安全组，记得放行 UDP $port"
+    fi
+    action_view_uri || true
+}
+
+# 入口/出口 IP：入口IP 用于所有链接；只重新生成链接，不重启服务
+action_entry_ip() {
+    run_relay_template entryip "${1:-}" || true
+    CUSTOM_IP=""
+    if [ -f "$CONFIG_PATH" ]; then
+        echo ""
+        action_view_uri || true
+    fi
+}
+
+# NAT 映射端口（查看端口→协议表 / 修改映射端口列表 / 开关 NAT 模式）
+action_nat_ports() { run_relay_template natports || true; }
+
 # 日志：首次运行新版 sb 时自动设置（清理脚本 + 每小时定时清理 + info→warn）；已设置好时跳过
 if [ "${1:-}" != "logsetup" ] && log_setup_needed; then
     run_relay_template logauto || true
 fi
 
 # 命令行快捷方式: sb relay = 线路机/直连节点管理；sb logclean / sb loglevel [warn|info]
+# sb addproto = 添加协议；sb entryip [IP] = 入口/出口 IP；sb natports = NAT 映射端口
 case "${1:-}" in
     relay) action_relay_local; exit $? ;;
     logsetup) run_relay_template logauto; exit $? ;;
     logclean) action_log_clean; exit 0 ;;
     loglevel) run_relay_template loglevel "${2:-}"; exit $? ;;
+    addproto) action_add_protocol; exit $? ;;
+    entryip) action_entry_ip "${2:-}"; exit 0 ;;
+    natports|nat) action_nat_ports; exit 0 ;;
 esac
 
 # 主循环
@@ -4713,6 +6163,9 @@ while true; do
                 relay_local) action_relay_local || true ;;
                 log_clean) action_log_clean ;;
                 log_level) action_log_level ;;
+                add_protocol) action_add_protocol || true ;;
+                entry_ip) action_entry_ip ;;
+                nat_ports) action_nat_ports ;;
                 *) warn "无效选项: $opt" ;;
             esac
             ;;
@@ -4728,5 +6181,7 @@ info "✅ 管理面板已创建,可输入 sb 打开管理面板"
 # 日志：安装每小时自动清理脚本 /usr/local/bin/sb-logrotate（单个日志超过 50MB 只保留最后 1MB），systemd 限制 journald 50MB
 "$SB_PATH" logsetup || warn "设置日志自动清理失败，可稍后再运行一次 sb"
 if [ -f /etc/sing-box-relay/relay.env ]; then
-    info "本机的线路机(中转/直连)节点由独立服务 sing-box-relay 运行，未受影响；在 sb 菜单最后一项「线路机/直连节点管理」里管理"
+    info "本机的线路机(中转/直连)节点由独立服务 sing-box-relay 运行，未受影响；在 sb 菜单「线路机/直连节点管理」里管理"
 fi
+# 清理 apk/apt 下载缓存（小硬盘）
+clean_pkg_cache
