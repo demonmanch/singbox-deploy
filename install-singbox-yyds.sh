@@ -2183,8 +2183,6 @@ generate_uris | while IFS= read -r line; do
     echo "   $line"
 done
 echo ""
-warn "⚠️ 链接不要分享给别人，避免连接数异常被商家封机"
-echo ""
 info "🔧 管理命令:"
 if [ "$OS" = "alpine" ]; then
     echo "   启动: rc-service sing-box start"
@@ -2681,7 +2679,6 @@ action_view_uri() {
     generate_uris || { err "生成 URI 失败"; return 1; }
     echo ""
     cat /etc/sing-box/uris.txt
-    sb_share_reminder
 }
 
 # 查看配置文件路径
@@ -3405,12 +3402,10 @@ show_link() {
         fi
         echo "===================================================="
         echo "所有链接也保存在: $RELAY_URI_FILE"
-        share_reminder
     elif [ -f "$RELAY_URI_FILE" ]; then
         echo "=============== 中转节点 Reality 链接 ==============="
         cat "$RELAY_URI_FILE"
         echo "===================================================="
-        share_reminder
     else
         err "未找到 $RELAY_URI_FILE"
         return 1
@@ -6253,14 +6248,6 @@ argo_main() {
     esac
 }
 
-# ===== 分享提醒（每次运行最多显示一次）=====
-share_reminder() {
-    [ -n "${SB_REMINDED:-}" ] && return 0
-    export SB_REMINDED=1
-    echo ""
-    warn "⚠️ 链接不要分享给别人，避免连接数异常被商家封机"
-}
-
 # ===== 端口连通性提示（itdog tcping）=====
 # 输出本机所有对外节点的「标签|端口|tcp/udp/both」（跳过只监听 127.0.0.1 的 Argo 入站）
 node_ports() {
@@ -6413,7 +6400,7 @@ sb_backup() {
     [ "$quiet" = "quiet" ] && return 0
     info "✅ 已备份到: $out （权限 600，只有 root 可读）"
     echo "   内容: ${parts# }（配置、密钥、节点名称、NAT/日志设置；不含程序和日志）"
-    warn "备份里有节点密钥/密码，等于全部节点链接，不要分享给别人；请下载到自己电脑保存，例如："
+    echo "   请下载到自己电脑保存，例如："
     echo "   scp -P SSH端口 root@入口IP:$out ."
     echo "   恢复: 把文件放到新机器 /root/ 下，输入 sb restore（全新机器先用一键脚本: bash install-singbox-yyds.sh restore $out）"
     return 0
@@ -6688,7 +6675,6 @@ sb_restore() {
     if [ "$has_land" = 1 ] && [ -z "${SB_FROM_PANEL:-}" ]; then
         restore_panel
     fi
-    [ -z "${SB_FROM_PANEL:-}" ] && share_reminder
     return 0
 }
 
@@ -6696,7 +6682,7 @@ sb_restore() {
 restore_panel() {
     local src="${SB_INSTALLER_SRC:-}" tmp tmpp
     if [ -f "$SB_CMD" ] && ! is_shortcut "$SB_CMD" && grep -q 'action_view_uri' "$SB_CMD" 2>/dev/null; then
-        echo ""; "$SB_CMD" links || true; export SB_REMINDED=1; return 0
+        echo ""; "$SB_CMD" links || true; return 0
     fi
     tmp=$(mktemp /tmp/sb-main.XXXXXX); tmpp=$(mktemp /tmp/sb-panel.XXXXXX)
     if [ -z "$src" ] || [ ! -f "$src" ]; then
@@ -6709,7 +6695,6 @@ restore_panel() {
         info "已安装 sb 管理面板: $SB_CMD"
         echo ""
         "$SB_CMD" links || true
-        export SB_REMINDED=1    # 面板显示链接时已经提醒过
     else
         warn "下载 sb 面板失败；落地机节点已恢复并在运行。以后执行一键脚本里的「更新 sb 面板」命令即可，链接用 sb → 1 查看"
     fi
@@ -6755,7 +6740,6 @@ case "$MODE" in
     backupmenu) backup_menu; exit $? ;;
     restore) shift; sb_restore "$@"; exit $? ;;
     tcphint) tcp_hint; exit 0 ;;
-    reminder) share_reminder; exit 0 ;;
 esac
 
 # 旧版线路机（节点在 /etc/sing-box）先迁移到独立目录/服务；迁移失败就停下，绝不另装一套
@@ -7440,26 +7424,16 @@ action_entry_ip() {
 # NAT 映射端口（查看端口→协议表 / 修改映射端口列表 / 开关 NAT 模式）
 action_nat_ports() { run_relay_template natports || true; }
 
-# 分享提醒：每次运行 sb 最多显示一次
-sb_share_reminder() {
-    [ -n "${SB_REMINDED:-}" ] && return 0
-    SB_REMINDED=1
-    echo ""
-    warn "⚠️ 链接不要分享给别人，避免连接数异常被商家封机"
-}
-
 # 从备份恢复（具体实现在线路机脚本模板里）；恢复了落地机节点就显示落地机链接
 action_restore() {
     local rc=0
-    SB_FROM_PANEL=1 SB_REMINDED=1 run_relay_template restore "$@" || rc=$?
+    SB_FROM_PANEL=1 run_relay_template restore "$@" || rc=$?
     [ "$rc" -eq 10 ] && return 0
     [ "$rc" -eq 0 ] || return "$rc"
     if [ -f /etc/sing-box/config.json ] && [ -f /etc/sing-box/.config_cache ]; then
         echo ""
         info "落地机节点链接："
         action_view_uri || true
-    else
-        sb_share_reminder
     fi
     return 0
 }
