@@ -618,7 +618,7 @@ rand_uuid() {
 # -----------------------
 # 配置节点名称后缀
 echo "请输入节点名称(留空则默认议名):"
-read -r user_name
+read -r user_name || user_name=""
 if [[ -n "$user_name" ]]; then
     suffix="-${user_name}"
     echo "$suffix" > /root/node_names.txt
@@ -637,7 +637,7 @@ select_protocols() {
     echo "5) AnyTLS Reality"
     echo ""
     echo "请输入要部署的协议编号(多个用空格分隔,如: 1 2 4):"
-    read -r protocol_input
+    read -r protocol_input || { err "没有读到输入，退出"; exit 1; }
     
     # 使用全局变量
     ENABLE_SS=false
@@ -704,7 +704,7 @@ select_ss_method() {
     echo "2) aes-128-gcm"
     echo ""
     echo "请输入选择(默认为 1):"
-    read -r ss_method_choice
+    read -r ss_method_choice || ss_method_choice=""
     
     case "${ss_method_choice:-1}" in
         1) SS_METHOD="2022-blake3-aes-128-gcm" ;;
@@ -1327,7 +1327,7 @@ install_singbox() {
             read -r -p "是否重新安装新版?(Y/n): " REINSTALL || REINSTALL=""
             [[ "$REINSTALL" =~ ^[Nn]$ ]] && { warn "继续使用 $have，可能出现配置校验失败"; return 0; }
         else
-            read -p "是否重新安装?(y/N): " REINSTALL
+            read -p "是否重新安装?(y/N): " REINSTALL || REINSTALL=""
             if [[ ! "$REINSTALL" =~ ^[Yy]$ ]]; then
                 info "跳过 sing-box 安装"
                 return 0
@@ -1587,7 +1587,7 @@ create_config() {
     fi
 
     # 构建 inbounds 内容（使用临时文件避免字符串处理问题）
-    local TEMP_INBOUNDS="/tmp/singbox_inbounds_$.json"
+    local TEMP_INBOUNDS="/tmp/singbox_inbounds_$$.json"
     > "$TEMP_INBOUNDS"
     
     local need_comma=false
@@ -1797,7 +1797,9 @@ CONFIG_TAIL
         exit 1
     fi
 
-    # 保存配置缓存（追加/覆盖）
+    # 保存配置缓存（追加/覆盖）；先记下旧缓存，最后把本次没写、也不属于协议参数的条目（如 LANDING_SSH_PORT）补回
+    local old_cache=""
+    [ -f /etc/sing-box/.config_cache ] && old_cache=$(cat /etc/sing-box/.config_cache 2>/dev/null || true)
     cat > /etc/sing-box/.config_cache <<CACHEEOF
 ENABLE_SS=$ENABLE_SS
 ENABLE_HY2=$ENABLE_HY2
@@ -1842,6 +1844,15 @@ CACHEEOF
     echo "CUSTOM_IP=$CUSTOM_IP" >> /etc/sing-box/.config_cache
     # NAT 模式下商家给的端口范围（仅作记录，方便以后查看）
     printf 'NAT_PORT_RANGE=%q\n' "${NAT_PORT_RANGE:-}" >> /etc/sing-box/.config_cache
+    if [ -n "$old_cache" ]; then
+        printf '%s\n' "$old_cache" | awk -F= 'FNR==NR{k=$0; sub(/=.*/,"",k); have[k]=1; next}
+            /^[A-Za-z_][A-Za-z0-9_]*=/ { k=$0; sub(/=.*/,"",k)
+                if (k in have) next
+                if (k ~ /^(ENABLE|SS|HY2|TUIC|REALITY|ANYTLS)_/) next
+                have[k]=1; print }' /etc/sing-box/.config_cache - >> /etc/sing-box/.config_cache.keep || true
+        if [ -s /etc/sing-box/.config_cache.keep ]; then cat /etc/sing-box/.config_cache.keep >> /etc/sing-box/.config_cache; fi
+        rm -f /etc/sing-box/.config_cache.keep
+    fi
 
     info "配置缓存已保存到 /etc/sing-box/.config_cache"
 }
@@ -2263,16 +2274,74 @@ detect_os
 
 # 服务控制
 service_start() {
-    [ "$OS" = "alpine" ] && rc-service "$SERVICE_NAME" start || systemctl start "$SERVICE_NAME"
+    if [ "$OS" = "alpine" ]; then rc-service "$SERVICE_NAME" start; else systemctl start "$SERVICE_NAME"; fi
 }
 service_stop() {
-    [ "$OS" = "alpine" ] && rc-service "$SERVICE_NAME" stop || systemctl stop "$SERVICE_NAME"
+    if [ "$OS" = "alpine" ]; then rc-service "$SERVICE_NAME" stop; else systemctl stop "$SERVICE_NAME"; fi
 }
 service_restart() {
-    [ "$OS" = "alpine" ] && rc-service "$SERVICE_NAME" restart || systemctl restart "$SERVICE_NAME"
+    if [ "$OS" = "alpine" ]; then rc-service "$SERVICE_NAME" restart; else systemctl restart "$SERVICE_NAME"; fi
 }
 service_status() {
-    [ "$OS" = "alpine" ] && rc-service "$SERVICE_NAME" status || systemctl status "$SERVICE_NAME" --no-pager
+    if [ "$OS" = "alpine" ]; then rc-service "$SERVICE_NAME" status; else systemctl status "$SERVICE_NAME" --no-pager; fi
+}
+# 服务是否真的在运行。OpenRC + supervise-daemon 时程序崩溃后 status 仍显示 started，
+# 所以还要看 supervise-daemon(pidfile 里的进程)下面有没有子进程
+service_is_active() {
+    if [ "$OS" = "alpine" ]; then
+        rc-service "$SERVICE_NAME" status >/dev/null 2>&1 || return 1
+        local pf="/run/${SERVICE_NAME}.pid" sp
+        if [ -f "$pf" ] && grep -qs 'supervise-daemon' "/etc/init.d/$SERVICE_NAME" && command -v pgrep >/dev/null 2>&1; then
+            sp=$(cat "$pf" 2>/dev/null || true)
+            [ -n "$sp" ] && pgrep -P "$sp" >/dev/null 2>&1 || return 1
+        fi
+        return 0
+    fi
+    systemctl is-active --quiet "$SERVICE_NAME"
+}
+
+# 本机是否有程序在监听端口 $1（TCP 或 UDP）
+sb_port_listening() {
+    if command -v ss >/dev/null 2>&1; then
+        ss -lntu 2>/dev/null | awk 'NR>1{print $5}'
+    elif command -v netstat >/dev/null 2>&1; then
+        netstat -lntu 2>/dev/null | awk '{print $4}'
+    fi | grep -qE "[:.]$1\$"
+}
+
+# 重置端口：$1=协议名 $2=jq 过滤器(用 $port) $3=新端口
+# 先生成新配置并 sing-box check；不通过就放弃（原配置和服务都不动）。
+# 通过后才替换并重启；重启后服务没起来就还原原配置再启动。
+reset_port_apply() {
+    local label="$1" filter="$2" port="$3" tmp="${CONFIG_PATH}.tmp" bak="${CONFIG_PATH}.bak"
+    if ! jq --argjson port "$port" "$filter" "$CONFIG_PATH" > "$tmp" 2>/dev/null || [ ! -s "$tmp" ]; then
+        rm -f "$tmp"; err "修改配置失败，原配置没有改动"; return 1
+    fi
+    if ! sing-box check -c "$tmp" >/dev/null 2>&1; then
+        err "新配置没有通过 sing-box check，已放弃修改（原配置和服务都没动）："
+        sing-box check -c "$tmp" 2>&1 | tail -n 3 | sed 's/^/   /' || true
+        rm -f "$tmp"; return 1
+    fi
+    cp -p "$CONFIG_PATH" "$bak"
+    info "正在停止服务..."
+    service_stop >/dev/null 2>&1 || warn "停止服务失败"
+    mv "$tmp" "$CONFIG_PATH"
+    service_start >/dev/null 2>&1 || true
+    # 等它真正监听新端口（NTP 不通时 sing-box 启动会慢约 10 秒）；中途服务退出就算失败
+    local i=0 up=1
+    while [ "$i" -lt 15 ]; do
+        sleep 1; i=$((i + 1))
+        if ! service_is_active; then up=0; break; fi
+        sb_port_listening "$port" && break
+    done
+    if [ "$up" = 0 ]; then
+        err "使用新端口 $port 启动失败（可能端口被占用），已还原原配置并重新启动"
+        cp -p "$bak" "$CONFIG_PATH"
+        service_restart >/dev/null 2>&1 || warn "启动服务失败"
+        return 1
+    fi
+    info "已启动服务并更新 ${label} 端口: $port"
+    return 0
 }
 
 # 生成随机值
@@ -2370,11 +2439,11 @@ fi
 
 # VLESS Reality 专属参数
 if [ "${ENABLE_REALITY:-false}" = "true" ]; then
-    REALITY_PORT=$(jq -r '.inbounds[] | select(.type=="vless") | .listen_port // empty' "$CONFIG_PATH" | head -n1)
+    REALITY_PORT=$(jq -r '.inbounds[] | select(.type=="vless" and (.tls.reality.enabled // false)) | .listen_port // empty' "$CONFIG_PATH" | head -n1)
 
-    REALITY_UUID=$(jq -r '.inbounds[] | select(.type=="vless") | .users[0].uuid // empty' "$CONFIG_PATH" | head -n1)
+    REALITY_UUID=$(jq -r '.inbounds[] | select(.type=="vless" and (.tls.reality.enabled // false)) | .users[0].uuid // empty' "$CONFIG_PATH" | head -n1)
 
-    REALITY_PK=$(jq -r '.inbounds[] | select(.type=="vless") | .tls.reality.private_key // empty' "$CONFIG_PATH" | head -n1)
+    REALITY_PK=$(jq -r '.inbounds[] | select(.type=="vless" and (.tls.reality.enabled // false)) | .tls.reality.private_key // empty' "$CONFIG_PATH" | head -n1)
 fi
 
 if [ "${ENABLE_ANYTLS:-false}" = "true" ]; then
@@ -2771,22 +2840,11 @@ action_reset_ss() {
         return 1
     fi
     
-    read -p "输入新的 SS 端口(回车保持 $SS_PORT): " new_port
+    read -p "输入新的 SS 端口(回车保持 $SS_PORT): " new_port || new_port=""
     new_port="${new_port:-$SS_PORT}"
     if [ "$new_port" != "${SS_PORT:-}" ]; then check_new_port "$new_port" || return 1; fi
     
-    info "正在停止服务..."
-    service_stop || warn "停止服务失败"
-    
-    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
-    
-    jq --argjson port "$new_port" '
-    .inbounds |= map(if .type=="shadowsocks" then .listen_port = $port else . end)
-    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
-    
-    info "已启动服务并更新 SS 端口: $new_port"
-    service_start || warn "启动服务失败"
-    sleep 1
+    reset_port_apply "SS" '.inbounds |= map(if .type=="shadowsocks" then .listen_port = $port else . end)' "$new_port" || return 1
     generate_uris || warn "生成 URI 失败"
 }
 
@@ -2799,22 +2857,11 @@ action_reset_hy2() {
         return 1
     fi
     
-    read -p "输入新的 HY2 端口(回车保持 $HY2_PORT): " new_port
+    read -p "输入新的 HY2 端口(回车保持 $HY2_PORT): " new_port || new_port=""
     new_port="${new_port:-$HY2_PORT}"
     if [ "$new_port" != "${HY2_PORT:-}" ]; then check_new_port "$new_port" || return 1; fi
     
-    info "正在停止服务..."
-    service_stop || warn "停止服务失败"
-    
-    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
-    
-    jq --argjson port "$new_port" '
-    .inbounds |= map(if .type=="hysteria2" then .listen_port = $port else . end)
-    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
-    
-    info "已启动服务并更新 HY2 端口: $new_port"
-    service_start || warn "启动服务失败"
-    sleep 1
+    reset_port_apply "HY2" '.inbounds |= map(if .type=="hysteria2" then .listen_port = $port else . end)' "$new_port" || return 1
     generate_uris || warn "生成 URI 失败"
 }
 
@@ -2827,22 +2874,11 @@ action_reset_tuic() {
         return 1
     fi
     
-    read -p "输入新的 TUIC 端口(回车保持 $TUIC_PORT): " new_port
+    read -p "输入新的 TUIC 端口(回车保持 $TUIC_PORT): " new_port || new_port=""
     new_port="${new_port:-$TUIC_PORT}"
     if [ "$new_port" != "${TUIC_PORT:-}" ]; then check_new_port "$new_port" || return 1; fi
     
-    info "正在停止服务..."
-    service_stop || warn "停止服务失败"
-    
-    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
-    
-    jq --argjson port "$new_port" '
-    .inbounds |= map(if .type=="tuic" then .listen_port = $port else . end)
-    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
-    
-    info "已启动服务并更新 TUIC 端口: $new_port"
-    service_start || warn "启动服务失败"
-    sleep 1
+    reset_port_apply "TUIC" '.inbounds |= map(if .type=="tuic" then .listen_port = $port else . end)' "$new_port" || return 1
     generate_uris || warn "生成 URI 失败"
 }
 
@@ -2855,22 +2891,11 @@ action_reset_reality() {
         return 1
     fi
     
-    read -p "输入新的 Vless Reality 端口(回车保持 $REALITY_PORT): " new_port
+    read -p "输入新的 Vless Reality 端口(回车保持 $REALITY_PORT): " new_port || new_port=""
     new_port="${new_port:-$REALITY_PORT}"
     if [ "$new_port" != "${REALITY_PORT:-}" ]; then check_new_port "$new_port" || return 1; fi
     
-    info "正在停止服务..."
-    service_stop || warn "停止服务失败"
-    
-    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
-    
-    jq --argjson port "$new_port" '
-    .inbounds |= map(if .type=="vless" then .listen_port = $port else . end)
-    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
-    
-    info "已启动服务并更新 Vless Reality 端口: $new_port"
-    service_start || warn "启动服务失败"
-    sleep 1
+    reset_port_apply "Vless Reality" '.inbounds |= map(if .type=="vless" and (.tls.reality.enabled // false) and .tag != "vless-direct-in" then .listen_port = $port else . end)' "$new_port" || return 1
     generate_uris || warn "生成 URI 失败"
 }
 
@@ -2883,22 +2908,11 @@ action_reset_anytls() {
         return 1
     fi
 
-    read -p "输入新的 AnyTLS Reality 端口(回车保持 $ANYTLS_PORT): " new_port
+    read -p "输入新的 AnyTLS Reality 端口(回车保持 $ANYTLS_PORT): " new_port || new_port=""
     new_port="${new_port:-$ANYTLS_PORT}"
     if [ "$new_port" != "${ANYTLS_PORT:-}" ]; then check_new_port "$new_port" || return 1; fi
 
-    info "正在停止服务..."
-    service_stop || warn "停止服务失败"
-
-    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
-
-    jq --argjson port "$new_port" '
-    .inbounds |= map(if .type=="anytls" then .listen_port = $port else . end)
-    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
-
-    info "已启动服务并更新 AnyTLS Reality 端口: $new_port"
-    service_start || warn "启动服务失败"
-    sleep 1
+    reset_port_apply "AnyTLS Reality" '.inbounds |= map(if .type=="anytls" then .listen_port = $port else . end)' "$new_port" || return 1
     generate_uris || warn "生成 URI 失败"
 }
 
@@ -2916,7 +2930,7 @@ action_update() {
             run_relay_template sbinstall "$need" || { err "更新 sing-box 失败"; return 1; }
         fi
     else
-        bash <(curl -fsSL https://sing-box.app/install.sh) || {
+        (cd "$(mktemp -d)" && bash <(curl -fsSL https://sing-box.app/install.sh)) || {
             err "下载 sing-box 失败"
             if [ -z "$(ip -4 route show default 2>/dev/null || true)" ]; then
                 warn "本机可能是纯 IPv6，GitHub 不支持 IPv6。可临时改用 NAT64 DNS 再更新："
@@ -2927,18 +2941,28 @@ action_update() {
         }
     fi
     
-    info "更新完成,已重启服务..."
     if command -v sing-box >/dev/null 2>&1; then
         NEW_VER=$(sing-box version 2>/dev/null | head -n1)
-        info "当前版本: $NEW_VER"
-        service_restart || warn "重启失败"
+        info "更新完成，当前版本: $NEW_VER，正在重启服务..."
+        service_restart || warn "重启 sing-box 失败"
+        # 本机的线路机节点(sing-box-relay)也用同一个 sing-box 程序，一起重启才会用上新版本
+        if [ "$OS" = "alpine" ]; then
+            if [ -f /etc/init.d/sing-box-relay ]; then
+                rc-service sing-box-relay restart >/dev/null 2>&1 && info "已重启 sing-box-relay" || warn "重启 sing-box-relay 失败"
+            fi
+        elif [ -f /etc/systemd/system/sing-box-relay.service ] \
+            && { systemctl is-enabled --quiet sing-box-relay 2>/dev/null || systemctl is-active --quiet sing-box-relay 2>/dev/null; }; then
+            systemctl restart sing-box-relay >/dev/null 2>&1 && info "已重启 sing-box-relay" || warn "重启 sing-box-relay 失败"
+        fi
     fi
 }
 
 # 卸载（只卸载落地机节点；本机的线路机节点 sing-box-relay 会询问是否一起卸载）
 action_uninstall() {
-    read -p "确认卸载落地机节点(sing-box 服务 + /etc/sing-box)?(y/N): " confirm
-    [[ ! "$confirm" =~ ^[Yy]$ ]] && info "已取消" && return 0
+    local confirm=""
+    read -p "确认卸载落地机节点(sing-box 服务 + /etc/sing-box)?(y/N): " confirm || confirm=""
+    # 取消时返回 10：菜单据此回到主菜单（不退出）
+    [[ ! "$confirm" =~ ^[Yy]$ ]] && info "已取消" && return 10
 
     local keep_relay=false ans
     if old_relay_layout; then
@@ -3148,7 +3172,8 @@ port_in_use() {
     # NAT 模式映射端口少：线路机节点只用 TCP，只看 TCP 占用（UDP 可以留给 HY2/TUIC 共用同一端口号）
     nat_on && fl="-lnt"
     if command -v ss >/dev/null 2>&1; then
-        addrs=$(ss "$fl" 2>/dev/null | awk 'NR>1{print $5}' || true)
+        # ss 只查一种协议(-lnt)时没有 Netid 列，本地地址在第 4 列；-lntu 时在第 5 列
+        addrs=$(ss "$fl" 2>/dev/null | awk -v c="$([ "$fl" = "-lnt" ] && echo 4 || echo 5)" 'NR>1{print $c}' || true)
     elif command -v netstat >/dev/null 2>&1; then
         addrs=$(netstat "$fl" 2>/dev/null | awk '{print $4}' || true)
     fi
@@ -4262,7 +4287,7 @@ UNIT
                 fi
                 rc-service crond status >/dev/null 2>&1 || rc-service crond start >/dev/null 2>&1 || warn "启动 crond 失败，日志不会自动清理：rc-service crond start"
             else
-                warn "未找到 crond 服务（/etc/init.d/crond），日志不会自动清理；可运行 apk add busybox-openrc 后再执行一次 sb"
+                warn "未找到 crond 服务（/etc/init.d/crond），日志不会自动清理；可运行 apk add busybox-openrc 后再执行 sb logsetup"
             fi
         fi
     fi
@@ -5090,6 +5115,7 @@ do_upgrade() {
     load_env || return 1
     mkdir -p "$SB_DIR"
     save_self_copy
+    argo_unit_refresh || true
     if ! service_installed; then install_service || true; else refresh_service; fi
     if ! svc_active; then svc_restart || warn "启动 $SVC_NAME 失败，请运行: bash $SELF_COPY status"; fi
     info "✅ 线路机脚本已更新到 $SELF_COPY（节点、端口、链接都没有改动）"
@@ -5765,11 +5791,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${ARGO_BIN} ${args}
+# 日志由 sh 追加写入（不用 systemd 240+ 才支持的 append: 输出方式），老系统也能用
+ExecStart=/bin/sh -c 'exec ${ARGO_BIN} ${args} >> ${ARGO_LOG} 2>&1'
 Restart=on-failure
 RestartSec=10s
-StandardOutput=append:${ARGO_LOG}
-StandardError=append:${ARGO_LOG}
 ${gm:+Environment=GOMEMLIMIT=${gm}
 Environment=GOGC=70
 }
@@ -5778,6 +5803,20 @@ WantedBy=multi-user.target
 ARGO_SVC_EOF
             ;;
     esac
+}
+
+# 旧版 Argo systemd 服务文件用的是 StandardOutput=append:（老 systemd 不支持，日志写不进去）。
+# 升级时只改写服务文件并 daemon-reload，不重启隧道（重启会换临时域名），下次重启隧道时生效
+argo_unit_refresh() {
+    [ "$(svc_kind)" = "systemd" ] || return 0
+    [ -f "$ARGO_UNIT" ] && grep -q 'StandardOutput=append:' "$ARGO_UNIT" 2>/dev/null || return 0
+    argo_enabled || return 0
+    [ -n "${ARGO_BIN:-}" ] || ARGO_BIN=$(sed -n 's/^ExecStart=\([^ ]*\).*/\1/p' "$ARGO_UNIT" | head -n1)
+    [ -n "${ARGO_BIN:-}" ] || ARGO_BIN="$ARGO_BIN_DEFAULT"
+    argo_service_text systemd > "$ARGO_UNIT.tmp" && mv "$ARGO_UNIT.tmp" "$ARGO_UNIT" || { rm -f "$ARGO_UNIT.tmp"; return 1; }
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    info "已更新 Argo 服务文件(兼容老版本 systemd)；当前隧道和域名不变，下次重启隧道时生效"
+    return 0
 }
 
 argo_svc() {
@@ -6380,6 +6419,14 @@ sb_backup() {
         rm -rf "$stage"; err "打包失败"; return 1
     fi
     rm -f "$stage/.list"
+    # 让备份里的目录权限和本机一致（例如 /etc/sing-box-relay 是 700），恢复时照原样还原
+    local d
+    for p in /etc/sing-box /etc/sing-box-relay /etc/sb-argo; do
+        [ -d "$p" ] && [ -d "$stage$p" ] || continue
+        while IFS= read -r d; do
+            [ -d "$stage/$d" ] && chmod "$(stat -c %a "/$d")" "$stage/$d" 2>/dev/null || true
+        done < <(cd / && find "${p#/}" -type d)
+    done
     [ -f /etc/sing-box/config.json ] && parts="$parts 落地机节点"
     [ -f /etc/sing-box-relay/relay.env ] && parts="$parts 线路机节点"
     [ -f /etc/sb-argo/argo.env ] && parts="$parts Argo"
@@ -6518,6 +6565,14 @@ restore_copy_tree() {
         [ "$f" = "$BACKUP_INFO" ] && continue
         mkdir -p "/$(dirname "$f")" && cp -p "$src/$f" "/$f" || return 1
     done < <(cd "$src" && find . -type f)
+    # 本脚本自己的目录按备份里的权限还原（旧备份没记录时保持原样）；/、/etc、/root 不动
+    while IFS= read -r f; do
+        f="${f#./}"
+        case "$f" in
+            etc/sing-box|etc/sing-box/*|etc/sing-box-relay|etc/sing-box-relay/*|etc/sb-argo|etc/sb-argo/*)
+                [ -d "/$f" ] && chmod "$(stat -c %a "$src/$f")" "/$f" 2>/dev/null || true ;;
+        esac
+    done < <(cd "$src" && find . -type d)
     return 0
 }
 
@@ -6727,6 +6782,7 @@ case "$MODE" in
     logclean) log_clean_now; exit 0 ;;
     loglevel) log_level_menu "${2:-}"; exit $? ;;
     logremove) log_remove; exit 0 ;;
+    argounit) argo_unit_refresh; exit $? ;;
     # NAT 模式 / 入口IP / 安装 sing-box（sb 面板也调用这些）
     natpick) nat_load; nat_on || exit 2; nat_collect_used "$LANDING_CONFIG" "$CONFIG"; nat_pick "${2:-tcp}"; exit $? ;;
     natports|nat) nat_menu; exit 0 ;;
@@ -6814,7 +6870,7 @@ action_generate_relay() {
     # 检查是否启用了SS
     if [ "${ENABLE_SS:-false}" != "true" ]; then
         warn "未检测到 SS 协议,需要先部署 SS 作为入站"
-        read -r -p "是否现在部署 SS 协议?(y/N): " deploy_ss
+        read -r -p "是否现在部署 SS 协议?(y/N): " deploy_ss || deploy_ss=""
         if [[ "$deploy_ss" =~ ^[Yy]$ ]]; then
             info "开始部署 SS 协议..."
 
@@ -6823,10 +6879,10 @@ action_generate_relay() {
             nat_def=$(nat_suggest_port ss || true)
             while true; do
                 if [ -n "$nat_def" ]; then
-                    read -r -p "请输入 SS 端口(NAT 模式，回车使用空闲映射端口 ${nat_def}): " USER_SS_PORT
+                    read -r -p "请输入 SS 端口(NAT 模式，回车使用空闲映射端口 ${nat_def}): " USER_SS_PORT || { err "没有读到输入，已取消"; return 1; }
                     SS_PORT="${USER_SS_PORT:-$nat_def}"
                 else
-                    read -r -p "请输入 SS 端口(NAT 机器请填商家映射的端口，留空则随机 10000-60000): " USER_SS_PORT
+                    read -r -p "请输入 SS 端口(NAT 机器请填商家映射的端口，留空则随机 10000-60000): " USER_SS_PORT || { err "没有读到输入，已取消"; return 1; }
                     SS_PORT="${USER_SS_PORT:-$(rand_port)}"
                 fi
                 if ! validate_port "$SS_PORT"; then
@@ -6951,14 +7007,14 @@ action_generate_relay() {
 
     while [ -z "$INBOUND_IP" ]; do
         if [ -n "${CUSTOM_IP:-}" ]; then
-            read -r -p "请输入落地机入口IP/域名(回车使用已保存的 ${CUSTOM_IP}): " input_ip
+            read -r -p "请输入落地机入口IP/域名(回车使用已保存的 ${CUSTOM_IP}): " input_ip || { err "没有读到输入，已取消"; return 1; }
             input_ip="$(normalize_host "${input_ip:-$CUSTOM_IP}")"
         else
-            read -r -p "请输入落地机入口IP/域名(商家提供的连接地址，回车=使用检测到的 ${DETECTED_IP}): " input_ip
+            read -r -p "请输入落地机入口IP/域名(商家提供的连接地址，回车=使用检测到的 ${DETECTED_IP}): " input_ip || { err "没有读到输入，已取消"; return 1; }
             input_ip="$(normalize_host "$input_ip")"
             if [ -z "$input_ip" ]; then
                 warn "检测到的 ${DETECTED_IP} 是出口IP，NAT/转发机上通常无法作为入口连接！"
-                read -r -p "确定使用 ${DETECTED_IP} 作为落地机地址?(y/N): " confirm
+                read -r -p "确定使用 ${DETECTED_IP} 作为落地机地址?(y/N): " confirm || { err "没有读到输入，已取消"; return 1; }
                 [[ "$confirm" =~ ^[Yy]$ ]] || continue
                 input_ip="$DETECTED_IP"
             fi
@@ -6982,7 +7038,7 @@ action_generate_relay() {
     if sb_nat_on && [ -n "${NAT_SSH_PORT:-}" ]; then SSH_PORT="$NAT_SSH_PORT"; fi
     validate_port "$SSH_PORT" || SSH_PORT="$DETECTED_SSH_PORT"
     while true; do
-        read -r -p "请输入落地机的 SSH 连接端口(就是你平时 SSH 登录本机用的端口，NAT 机器填商家映射的端口，回车默认 ${SSH_PORT}): " input_ssh
+        read -r -p "请输入落地机的 SSH 连接端口(就是你平时 SSH 登录本机用的端口，NAT 机器填商家映射的端口，回车默认 ${SSH_PORT}): " input_ssh || input_ssh=""
         input_ssh=$(printf '%s' "${input_ssh:-$SSH_PORT}" | tr -d '[:space:]')
         if validate_port "$input_ssh"; then
             SSH_PORT="$input_ssh"
@@ -7005,11 +7061,11 @@ action_generate_relay() {
             warn "落地机地址与检测到的出口IP 相同；若本机是 NAT/转发机，请改为入口IP"
         fi
         echo ""
-        read -r -p "确认生成?(y=确认 / i=输入其他落地IP / N=取消): " confirm
+        read -r -p "确认生成?(y=确认 / i=输入其他落地IP / N=取消): " confirm || confirm=""
         case "$confirm" in
             [Yy]) break ;;
             [Ii])
-                read -r -p "请输入落地机入口IP或域名: " input_ip
+                read -r -p "请输入落地机入口IP或域名: " input_ip || input_ip=""
                 input_ip="$(normalize_host "$input_ip")"
                 if validate_host "$input_ip"; then
                     INBOUND_IP="$input_ip"
@@ -7093,7 +7149,7 @@ action_generate_relay() {
     echo "=========================================================="
     echo ""
 
-    read -r -p "是否显示完整脚本内容?(y/N): " show_full
+    read -r -p "是否显示完整脚本内容?(y/N): " show_full || show_full=""
     if [[ "$show_full" =~ ^[Yy]$ ]]; then
         echo "----------------------------------------"
         cat "$RELAY_SCRIPT"
@@ -7458,6 +7514,10 @@ action_backup_menu() {
 if [ "${1:-}" != "logsetup" ] && log_setup_needed; then
     run_relay_template logauto || true
 fi
+# 旧版 Argo 服务文件（StandardOutput=append:）换成老 systemd 也能用的写法；不重启隧道
+if [ -f /etc/systemd/system/sb-argo.service ] && grep -q 'StandardOutput=append:' /etc/systemd/system/sb-argo.service 2>/dev/null; then
+    run_relay_template argounit || true
+fi
 
 # 命令行快捷方式: sb relay = 线路机/直连节点管理；sb logclean / sb loglevel [warn|info]
 # sb addproto = 添加协议；sb entryip [IP] = 入口/出口 IP；sb natports = NAT 映射端口
@@ -7481,7 +7541,8 @@ esac
 # 主循环
 while true; do
     show_menu
-    read -p "请输入选项: " opt
+    # 读不到输入(EOF/管道结束)时直接退出，避免死循环
+    read -p "请输入选项: " opt || { echo ""; exit 0; }
     
     # 处理退出
     if [ "$opt" = "0" ]; then
@@ -7497,18 +7558,18 @@ while true; do
             # 处理动态选项
             action="${MENU_MAP[$opt]:-}"
             case "$action" in
-                reset_ss) action_reset_ss ;;
-                reset_hy2) action_reset_hy2 ;;
-                reset_tuic) action_reset_tuic ;;
-                reset_reality) action_reset_reality ;;
-                reset_anytls) action_reset_anytls ;;
+                reset_ss) action_reset_ss || true ;;
+                reset_hy2) action_reset_hy2 || true ;;
+                reset_tuic) action_reset_tuic || true ;;
+                reset_reality) action_reset_reality || true ;;
+                reset_anytls) action_reset_anytls || true ;;
                 start) service_start && info "已启动" ;;
                 stop) service_stop && info "已停止" ;;
                 restart) service_restart && info "已重启" ;;
                 status) service_status; run_relay_template tcphint || true ;;
                 update) action_update || true ;;
                 relay) action_generate_relay || true ;;
-                uninstall) action_uninstall; exit 0 ;;
+                uninstall) if action_uninstall; then exit 0; fi ;;   # 取消/失败时回到菜单
                 relay_local) action_relay_local || true ;;
                 log_clean) action_log_clean ;;
                 log_level) action_log_level ;;
