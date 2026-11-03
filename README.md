@@ -8,6 +8,20 @@
 > curl -fsSL https://raw.githubusercontent.com/demonmanch/singbox-deploy/main/install-singbox-yyds.sh -o /tmp/install-singbox.sh && bash /tmp/install-singbox.sh
 > ```
 >
+> 全新 Alpine（没有 curl/bash）用这条：
+>
+> ```bash
+> apk add --no-cache bash ca-certificates curl && curl -fsSL https://raw.githubusercontent.com/demonmanch/singbox-deploy/main/install-singbox-yyds.sh -o /tmp/install-singbox.sh && bash /tmp/install-singbox.sh
+> ```
+>
+> 如果 `apk` 卡在 `fetch ... APKINDEX` 不动，多半是这台机器的 IPv6 坏了（软件源域名解析出了 IPv6 地址，但连不上）。先按 Ctrl+C，执行下面这条（把软件源域名固定到 IPv4），再重新运行上面的命令：
+>
+> ```bash
+> IP=$(nslookup -type=A dl-cdn.alpinelinux.org 1.1.1.1 | awk '/^Address/{for(i=2;i<=NF;i++)if($i~/^[0-9]+(\.[0-9]+){3}$/&&$i!="1.1.1.1")ip=$i}END{print ip}'); [ -n "$IP" ] && sed -i '/dl-cdn\.alpinelinux\.org/d' /etc/hosts && echo "$IP dl-cdn.alpinelinux.org" >> /etc/hosts && echo "已写入 hosts: $IP" || echo "没查到 IPv4，hosts 没改动"
+> ```
+>
+> 这条只需执行一次（重复执行也只会保留一条记录）；如果提示「没查到 IPv4」，说明这台机器连 1.1.1.1 的 DNS 也查不了，需要先检查网络。
+>
 > （脚本已超过 128KB，旧写法 `bash -c "$(curl ...)"` 会报 `Argument list too long`，请用上面「先下载再运行」的写法。）
 >
 > 修复 `install-singbox-yyds.sh` 中 `sb` 菜单「生成线路机脚本(出口为本机ss协议)」的问题（在 Alpine 3.21 LXC NAT 小鸡上实际踩坑）：
@@ -271,3 +285,17 @@
 ```bash
 curl -fsSL https://raw.githubusercontent.com/demonmanch/singbox-deploy/main/install-singbox-yyds.sh -o /tmp/install-singbox.sh && bash /tmp/install-singbox.sh
 ```
+
+全新 Alpine（没有 curl/bash）用这条：
+
+```bash
+apk add --no-cache bash ca-certificates curl && curl -fsSL https://raw.githubusercontent.com/demonmanch/singbox-deploy/main/install-singbox-yyds.sh -o /tmp/install-singbox.sh && bash /tmp/install-singbox.sh
+```
+
+如果 `apk` 卡在 `fetch ... APKINDEX` 不动，多半是这台机器的 IPv6 坏了（软件源域名解析出了 IPv6 地址，但连不上）。先按 Ctrl+C，执行下面这条（把软件源域名固定到 IPv4），再重新运行上面的命令：
+
+```bash
+IP=$(nslookup -type=A dl-cdn.alpinelinux.org 1.1.1.1 | awk '/^Address/{for(i=2;i<=NF;i++)if($i~/^[0-9]+(\.[0-9]+){3}$/&&$i!="1.1.1.1")ip=$i}END{print ip}'); [ -n "$IP" ] && sed -i '/dl-cdn\.alpinelinux\.org/d' /etc/hosts && echo "$IP dl-cdn.alpinelinux.org" >> /etc/hosts && echo "已写入 hosts: $IP" || echo "没查到 IPv4，hosts 没改动"
+```
+
+这条只需执行一次（重复执行也只会保留一条记录）；如果提示「没查到 IPv4」，说明这台机器连 1.1.1.1 的 DNS 也查不了，需要先检查网络。
